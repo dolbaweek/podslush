@@ -723,6 +723,8 @@ async def heartbeat():
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
+    global night_mode_enabled, maintenance_mode  # ВАЖНО: В САМОМ НАЧАЛЕ!
+    
     try:
         async with db_pool.acquire() as db:
             await db.execute("""
@@ -735,6 +737,7 @@ async def start(message: Message, state: FSMContext):
     
     log_user_action(message.from_user.id, "START")
 
+    # Проверка техработ (теперь maintenance_mode определена)
     if message.from_user.id not in ADMINS and maintenance_mode:
         try:
             async with db_pool.acquire() as db:
@@ -758,7 +761,6 @@ async def start(message: Message, state: FSMContext):
         ]
         
         if message.from_user.id == SUPER_ADMIN:
-            global night_mode_enabled, maintenance_mode
             night_status = "✅ Включен" if night_mode_enabled else "❌ Выключен"
             maint_status = "🔧 Включены" if maintenance_mode else "🔧 Выключены"
             keyboard_buttons.append([KeyboardButton(text=f"🌙 Ночной режим ({night_status})")])
