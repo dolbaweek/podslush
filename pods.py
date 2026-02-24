@@ -6,9 +6,10 @@ from cachetools import TTLCache
 import os
 import re
 import sys
-import signal
 from contextlib import asynccontextmanager
-from typing import Optional
+from PIL import Image, ImageDraw, ImageFont
+import io
+import tempfile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -18,19 +19,17 @@ from aiogram.types import (
     CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    FSInputFile
 )
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramNetworkError
-import aiohttp
-from aiohttp import ClientConnectorError
 
 
-# ================= КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =================
+# ================= КОНФИГУРАЦИЯ =================
 
 TOKEN = os.getenv('BOT_TOKEN', "8587934352:AAHdfiuD0VrNQ-Dp0801dYNnR7_nae92Aso")
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', "-1003713957228"))
@@ -38,14 +37,7 @@ SUPER_ADMIN = int(os.getenv('SUPER_ADMIN', "8438783644"))
 ADMINS = [int(x) for x in os.getenv('ADMINS', "8438783644,8488564574,8283468381").split(',')]
 BOT_USERNAME = os.getenv('BOT_USERNAME', "pods10_bot")
 
-# Настройка логирования для Railway
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ================= КОНСТАНТЫ =================
@@ -56,7 +48,7 @@ NIGHT_POST_INTERVAL = 30
 INSULT_THRESHOLD = 4
 LONG_MESSAGE_THRESHOLD = 60
 
-# ================= ИНИЦИАЛИЗАЦИЯ БОТА =================
+# ================= ИНИЦИАЛИЗАЦИЯ =================
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -67,16 +59,16 @@ msg_cache = TTLCache(maxsize=500, ttl=60)
 admin_cache = TTLCache(maxsize=100, ttl=60)
 pending_cache = TTLCache(maxsize=200, ttl=30)
 blacklist_cache = TTLCache(maxsize=1000, ttl=300)
+user_message_cooldown = TTLCache(maxsize=1000, ttl=1800)
 
 # Флаги
 night_mode_enabled = False
 maintenance_mode = False
-maintenance_exceptions = set()
+maintenance_exceptions = set()  # Только ОДНО определение!
 shutdown_flag = False
 
 # ================= БАЗОВЫЕ СПИСКИ СЛОВ =================
 
-# Базовый словарь оскорблений (можно расширять)
 DEFAULT_INSULTS = [
     # ДУРАК / ТУПОСТЬ (все формы)
     "дурак", "дурака", "дураку", "дураком", "дураке", "дураки", "дураков", "дуракам", "дураками",
@@ -209,7 +201,6 @@ DEFAULT_INSULTS = [
     "наебениться", "наебенился"
 ]
 
-# Словарь аморального контента (нельзя автоматически публиковать)
 IMMORAL_CONTENT = [
     # СЕКС / ПОРНО / ЭРОТИКА
     "секс", "секса", "сексу", "сексом", "сексе", "сексуальный", "сексуального", "сексуальные",
@@ -223,7 +214,7 @@ IMMORAL_CONTENT = [
     "обнаженный", "обнаженного", "обнаженному", "обнаженным", "обнажен",
     "нагая", "нагой", "нагую", "нагие", "нагих", "нагой", "нагое",
 
-    # ЧАСТИ ТЕЛА (детские/сленг)
+    # ЧАСТИ ТЕЛА
     "писька", "письки", "письке", "письку", "писькой", "писюн", "писюна", "писюнчик",
     "пися", "писи", "писе", "писю", "писей", "писям",
     "попа", "попы", "попе", "попу", "попой", "попка", "попки", "попку", "попке",
@@ -236,7 +227,7 @@ IMMORAL_CONTENT = [
     "вагина", "вагины", "вагине", "вагину", "вагиной", "вагинальный",
     "влагалище", "влагалища", "влагалищу", "влагалищем", "влагалищ",
 
-    # ДЕЙСТВИЯ (лизать, сосать)
+    # ДЕЙСТВИЯ
     "лизнуть", "лизнул", "лизнула", "лизнули", "лизнешь", "лижет", "лижешь",
     "облизать", "оближу", "оближет", "облизал", "облизала", "оближи", "оближите",
     "лизать", "лижу", "лижет", "лижут", "лизал", "лизала", "лижи",
@@ -254,14 +245,14 @@ IMMORAL_CONTENT = [
     "дрочить", "дрочу", "дрочит", "дрочат", "дрочил", "дрочила", "дрочи",
     "дрочка", "дрочки", "дрочке", "дрочку", "дрочкой",
 
-    # НОГИ / СТУПНИ (фут-фетиш)
+    # НОГИ / СТУПНИ
     "ножки", "ножек", "ножкам", "ножками", "ножках", "ножка", "ножку", "ножке",
     "ноги", "ног", "ногам", "ногами", "ногах", "нога", "ногу", "ногой",
     "ступни", "ступней", "ступням", "ступнями", "ступнях", "ступня", "ступню", "ступней",
     "пальцы ног", "пальцев ног", "пальцам ног", "пальцами ног", "пальчик ноги",
     "облизать ноги", "оближет ноги", "лижет ноги", "лизать ноги", "лижу ноги",
 
-    # ПОЛОВОЙ АКТ (трахать, ебать)
+    # ПОЛОВОЙ АКТ
     "трахнуть", "трахну", "трахнешь", "трахнет", "трахнут", "трахнул", "трахнула", "трахнули",
     "трахать", "трахаю", "трахает", "трахают", "трахал", "трахала", "трахали",
     "выебать", "выебу", "выебет", "выебут", "выебал", "выебала",
@@ -303,7 +294,6 @@ IMMORAL_CONTENT = [
 
 IMMORAL_PATTERNS = [re.compile(rf'\b{re.escape(word)}\b', re.IGNORECASE) for word in IMMORAL_CONTENT]
 
-# Паттерны для ссылок
 URL_PATTERNS = [
     r'https?://\S+',           # http:// или https://
     r't\.me/\S+',              # t.me ссылки
@@ -329,6 +319,15 @@ MAINTENANCE_MESSAGE = (
     "Приносим извинения за неудобства!"
 )
 
+ADMIN_MESSAGE_INFO = (
+    "📬 <b>Отправка сообщения администрации</b>\n\n"
+    "Вы можете написать личное сообщение администрации канала.\n"
+    "• Сообщение будет доставлено лично админам\n"
+    "• Отправлять можно <b>раз в 30 минут</b>\n"
+    "• Не злоупотребляйте, пожалуйста\n\n"
+    "Напишите ваше сообщение одним текстом:"
+)
+
 # ================= СОСТОЯНИЯ FSM =================
 
 class AdminStates(StatesGroup):
@@ -339,7 +338,8 @@ class AdminStates(StatesGroup):
     waiting_for_blacklist_remove = State()
     waiting_for_mute_duration = State()
     waiting_for_mute_user = State()
-    waiting_for_reply = State()
+    waiting_for_admin_message = State()
+    # Убрал waiting_for_reply_text - используем словарь reply_storage
 
 # ================= ПУЛ БАЗЫ ДАННЫХ =================
 
@@ -410,6 +410,59 @@ def is_night_time() -> bool:
         return NIGHT_MODE_START <= hour < NIGHT_MODE_END
     return hour >= NIGHT_MODE_START or hour < NIGHT_MODE_END
 
+# ================= ВОДЯНОЙ ЗНАК =================
+
+async def add_watermark_to_photo(photo_file_id: str) -> str:
+    try:
+        file = await bot.get_file(photo_file_id)
+        photo_bytes = await bot.download_file(file.file_path)
+
+        img = Image.open(photo_bytes).convert("RGBA")
+        txt = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt)
+
+        text = "@podslu10"
+        font_size = max(40, int(img.width * 0.15))
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        x = (img.width - text_width) // 2
+        y = (img.height - text_height) // 2
+
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 200))
+        draw.text((x+2, y+2), text, font=font, fill=(0, 0, 0, 100))
+
+        watermarked = Image.alpha_composite(img, txt).convert("RGB")
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
+            temp_path = tmp_file.name
+            watermarked.save(temp_path, format="JPEG", quality=95)
+
+        msg = await bot.send_photo(
+            chat_id=SUPER_ADMIN,
+            photo=FSInputFile(temp_path)
+        )
+        
+        new_file_id = msg.photo[-1].file_id
+        os.unlink(temp_path)
+        
+        logger.info(f"Watermark added successfully")
+        return new_file_id
+
+    except Exception as e:
+        logger.error(f"Watermark error: {e}")
+        return photo_file_id
+
 # ================= ЛОГИРОВАНИЕ =================
 
 async def log_action(text):
@@ -445,7 +498,7 @@ async def load_blacklist_to_cache():
             blacklist_cache.clear()
             for word in words:
                 blacklist_cache[word[0]] = True
-        logger.info(f"Загружено {len(blacklist_cache)} слов в черный список")
+        logger.info(f"Загружено {len(blacklist_cache)} слов")
     except Exception as e:
         logger.error(f"Ошибка загрузки черного списка: {e}")
 
@@ -487,10 +540,6 @@ async def init_db():
         except:
             pass
         
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_reviewer ON messages(reviewer)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
-        
         await db.execute("""
         CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
@@ -526,6 +575,16 @@ async def init_db():
             target_id INTEGER,
             details TEXT,
             created_at TEXT
+        )
+        """)
+        
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS admin_messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            message TEXT,
+            created_at TEXT,
+            status TEXT DEFAULT 'new'
         )
         """)
         
@@ -626,11 +685,9 @@ async def post_next_message():
         )
         
         await notify_admins_about_auto_post(msg_id, user_id, "текст", counter)
-        logger.info(f"AUTO POST: #{counter} от пользователя {user_id}")
         
     except Exception as e:
         logger.error(f"Ошибка авто-публикации: {e}")
-        await log_action(f"Ошибка авто-публикации: {e}")
 
 async def auto_post_messages():
     global night_mode_enabled, shutdown_flag
@@ -691,8 +748,6 @@ async def check_long_pending_messages():
                         "UPDATE messages SET notified_long=1 WHERE id=?",
                         (msg_id,)
                     )
-                    
-                    logger.info(f"Long message notification sent for #{msg_id}")
                 
                 await db.commit()
         
@@ -723,7 +778,7 @@ async def heartbeat():
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
-    global night_mode_enabled, maintenance_mode  # ВАЖНО: В САМОМ НАЧАЛЕ!
+    global night_mode_enabled, maintenance_mode
     
     try:
         async with db_pool.acquire() as db:
@@ -737,7 +792,6 @@ async def start(message: Message, state: FSMContext):
     
     log_user_action(message.from_user.id, "START")
 
-    # Проверка техработ (теперь maintenance_mode определена)
     if message.from_user.id not in ADMINS and maintenance_mode:
         try:
             async with db_pool.acquire() as db:
@@ -780,10 +834,12 @@ async def start(message: Message, state: FSMContext):
         await message.answer("👑 <b>Панель администратора</b>", reply_markup=keyboard)
         return
 
+    # Обычные пользователи
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="ℹ Информация")],
-            [KeyboardButton(text="❓ Помощь")]
+            [KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="📩 Написать админу")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Отправьте сообщение, фото или видео..."
@@ -800,7 +856,6 @@ async def start(message: Message, state: FSMContext):
 
 @dp.message(F.text == "ℹ Информация")
 async def info_text(message: Message):
-    log_user_action(message.from_user.id, "INFO")
     await message.answer(
         "ℹ <b>Информация</b>\n\n"
         "Все сообщения проходят модерацию и публикуются анонимно.\n"
@@ -814,7 +869,6 @@ async def info_text(message: Message):
 
 @dp.message(F.text == "❓ Помощь")
 async def help_text(message: Message):
-    log_user_action(message.from_user.id, "HELP")
     await message.answer(
         "❓ <b>Помощь</b>\n\n"
         "Просто отправьте текст, фото или видео. Они будут проверены модератором.\n"
@@ -826,6 +880,143 @@ async def help_text(message: Message):
         "• Реклама\n\n"
         "Фото и видео всегда проходят ручную проверку."
     )
+
+# ================= ЛИЧНОЕ СООБЩЕНИЕ АДМИНУ =================
+
+@dp.message(F.text == "📩 Написать админу")
+async def ask_admin(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    if user_id in user_message_cooldown:
+        remaining = user_message_cooldown[user_id]
+        minutes = remaining // 60
+        seconds = remaining % 60
+        await message.answer(f"⏳ Вы уже отправляли сообщение. Подождите {minutes} мин {seconds} сек.")
+        return
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await state.set_state(AdminStates.waiting_for_admin_message)
+    await message.answer(ADMIN_MESSAGE_INFO, reply_markup=keyboard)
+
+@dp.message(AdminStates.waiting_for_admin_message)
+async def send_to_admin(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    if message.text == "❌ Отмена":
+        await state.clear()
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="ℹ Информация")],
+                [KeyboardButton(text="❓ Помощь")],
+                [KeyboardButton(text="📩 Написать админу")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("❌ Отправка отменена", reply_markup=keyboard)
+        return
+
+    text = message.text
+    if not text:
+        await message.answer("❌ Напишите текст сообщения")
+        return
+
+    async with db_pool.acquire() as db:
+        await db.execute(
+            "INSERT INTO admin_messages (user_id, message, created_at) VALUES (?, ?, ?)",
+            (user_id, text, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Рассмотрено", callback_data=f"adminmsg_done_{user_id}"),
+            InlineKeyboardButton(text="🔇 Мут", callback_data=f"adminmsg_mute_{user_id}")
+        ],
+        [
+            InlineKeyboardButton(text="💬 Ответить", callback_data=f"adminmsg_reply_{user_id}")
+        ]
+    ])
+
+    await bot.send_message(
+        SUPER_ADMIN,
+        f"📩 <b>Личное сообщение</b>\n\n"
+        f"👤 ID: <code>{user_id}</code>\n"
+        f"📛 Username: @{message.from_user.username or 'нет'}\n"
+        f"📝 Имя: {message.from_user.first_name or 'нет'}\n\n"
+        f"💬 <b>Сообщение:</b>\n{text}",
+        reply_markup=keyboard
+    )
+
+    user_message_cooldown[user_id] = 1800
+
+    keyboard_normal = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="ℹ Информация")],
+            [KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="📩 Написать админу")]
+        ],
+        resize_keyboard=True
+    )
+
+    await message.answer("✅ Сообщение отправлено администрации. Ожидайте ответа.", reply_markup=keyboard_normal)
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("adminmsg_done_"))
+async def admin_message_done(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    user_id = int(callback.data.split("_")[2])
+    
+    async with db_pool.acquire() as db:
+        await db.execute(
+            "UPDATE admin_messages SET status='reviewed' WHERE user_id=? AND status='new'",
+            (user_id,)
+        )
+        await db.commit()
+    
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ <b>Рассмотрено</b>",
+        reply_markup=None
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adminmsg_mute_"))
+async def admin_message_mute(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    user_id = int(callback.data.split("_")[2])
+
+    await state.update_data(mute_user_id=user_id)
+    await state.set_state(AdminStates.waiting_for_mute_duration)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1 час", callback_data="mute_1h"),
+            InlineKeyboardButton(text="3 часа", callback_data="mute_3h"),
+            InlineKeyboardButton(text="6 часов", callback_data="mute_6h")
+        ],
+        [
+            InlineKeyboardButton(text="12 часов", callback_data="mute_12h"),
+            InlineKeyboardButton(text="1 день", callback_data="mute_1d"),
+            InlineKeyboardButton(text="3 дня", callback_data="mute_3d")
+        ],
+        [
+            InlineKeyboardButton(text="7 дней", callback_data="mute_7d"),
+            InlineKeyboardButton(text="30 дней", callback_data="mute_30d"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="mute_cancel")
+        ]
+    ])
+
+    await callback.message.answer(
+        f"⏳ Выберите длительность мута для пользователя {user_id}:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
 
 # ================= АДМИНСКИЕ КНОПКИ =================
 
@@ -869,11 +1060,6 @@ async def admin_stats(message: Message):
     if message.from_user.id not in ADMINS:
         return
     
-    cache_key = "stats"
-    if cache_key in admin_cache:
-        await message.answer(admin_cache[cache_key])
-        return
-    
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute("""
@@ -891,11 +1077,12 @@ async def admin_stats(message: Message):
                     (SELECT COUNT(*) FROM messages WHERE insult_count >= ?) as heavy_insults,
                     (SELECT value FROM settings WHERE key='post_counter') as post_counter,
                     (SELECT COUNT(*) FROM blacklist) as blacklist_count,
-                    (SELECT COUNT(*) FROM admin_actions WHERE date(created_at) = date('now')) as today_actions
+                    (SELECT COUNT(*) FROM admin_actions WHERE date(created_at) = date('now')) as today_actions,
+                    (SELECT COUNT(*) FROM admin_messages WHERE status='new') as new_messages
             """, (INSULT_THRESHOLD,))
             
             result = await cursor.fetchone()
-            total_users, banned_users, muted_users, exception_users, total_messages, pending_messages, media_messages, auto_posted, with_links, skipped_messages, heavy_insults, post_counter, blacklist_count, today_actions = result
+            total_users, banned_users, muted_users, exception_users, total_messages, pending_messages, media_messages, auto_posted, with_links, skipped_messages, heavy_insults, post_counter, blacklist_count, today_actions, new_messages = result
     except Exception as e:
         logger.error(f"DB error in admin_stats: {e}")
         await message.answer("❌ Ошибка получения статистики")
@@ -918,13 +1105,12 @@ async def admin_stats(message: Message):
         f"📝 Опубликовано постов: {post_counter}\n"
         f"📚 Черный список: {blacklist_count} слов\n"
         f"📋 Действий сегодня: {today_actions}\n"
+        f"📩 Новых личных сообщений: {new_messages}\n"
         f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}\n"
         f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}"
     )
     
-    admin_cache[cache_key] = stats_text
     await message.answer(stats_text)
-    logger.info(f"STATS requested by admin {message.from_user.id}")
 
 @dp.message(F.text == "👥 Управление пользователями")
 async def admin_users(message: Message, state: FSMContext):
@@ -948,12 +1134,6 @@ async def admin_pending_messages(message: Message):
     if message.from_user.id not in ADMINS:
         return
     
-    cache_key = f"pending_list_{message.from_user.id}"
-    if cache_key in pending_cache:
-        cached = pending_cache[cache_key]
-        await message.answer(cached["text"], reply_markup=cached["keyboard"])
-        return
-    
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
@@ -964,8 +1144,7 @@ async def admin_pending_messages(message: Message):
             cursor = await db.execute("""
                 SELECT id, user_id, media_type, 
                        substr(text, 1, 50) as short_text, 
-                       created_at, has_links, insult_count,
-                       julianday('now') - julianday(created_at) > 0.0417 as is_old
+                       created_at, has_links, insult_count
                 FROM messages 
                 WHERE status='pending' AND skipped=0
                 ORDER BY created_at DESC 
@@ -981,13 +1160,13 @@ async def admin_pending_messages(message: Message):
         await message.answer("📨 Нет сообщений, ожидающих проверки")
         return
     
-    text = f"📨 <b>Ожидают проверки: {total_pending}</b>\n\n"
+    text = f"📨 Ожидают проверки: {total_pending}\n\n"
     if total_pending > 10:
-        text += f"<i>Показаны последние 10 из {total_pending}</i>\n\n"
+        text += f"Показаны последние 10 из {total_pending}\n\n"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     
-    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count, is_old in pending_messages:
+    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count in pending_messages:
         try:
             msg_date = datetime.fromisoformat(created_at)
             date_str = msg_date.strftime('%d.%m %H:%M')
@@ -997,31 +1176,27 @@ async def admin_pending_messages(message: Message):
         if media_type == "photo":
             emoji = "📸"
             content_type = "Фото"
-            media_warning = " 🚫(авто-пост запрещен)"
         elif media_type == "video":
             emoji = "🎥"
             content_type = "Видео"
-            media_warning = " 🚫(авто-пост запрещен)"
         else:
             emoji = "📝"
             content_type = "Текст"
-            media_warning = ""
         
         warnings = []
         if has_links:
             warnings.append("🔗")
         if insult_count >= INSULT_THRESHOLD:
             warnings.append(f"🤬{insult_count}")
-        if is_old:
-            warnings.append("⚠️ СТАРОЕ")
         
         warning_str = f" {' '.join(warnings)}" if warnings else ""
+        
         display_text = short_text.replace('\n', ' ').strip() if short_text else "без текста"
         if len(display_text) > 30:
             display_text = display_text[:30] + "..."
         
-        text += f"{emoji} <b>#{msg_id}</b>{warning_str}{media_warning} | {date_str}\n"
-        text += f"👤 ID: <code>{user_id}</code>\n"
+        text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+        text += f"👤 ID: {user_id}\n"
         text += f"💬 {display_text}\n\n"
         
         keyboard.inline_keyboard.append([
@@ -1035,7 +1210,6 @@ async def admin_pending_messages(message: Message):
         InlineKeyboardButton(text="🔄 Обновить список", callback_data="refresh_pending")
     ])
     
-    pending_cache[cache_key] = {"text": text, "keyboard": keyboard}
     await message.answer(text, reply_markup=keyboard)
 
 @dp.message(F.text == "❌ Закрыть меню")
@@ -1092,6 +1266,30 @@ async def blacklist_remove_prompt(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+@dp.callback_query(F.data == "blacklist_show")
+async def blacklist_show(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    words = list(blacklist_cache.keys())
+    if not words:
+        await callback.message.answer("📝 Черный список пуст")
+        await callback.answer()
+        return
+    text = "📝 <b>Полный черный список</b>\n\n"
+    for i, word in enumerate(words, 1):
+        text += f"{i}. <code>{word}</code>\n"
+        if i % 50 == 0:
+            await callback.message.answer(text)
+            text = ""
+    if text:
+        await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "blacklist_close")
+async def blacklist_close(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
+
 @dp.message(AdminStates.waiting_for_blacklist_add)
 async def process_blacklist_add(message: Message, state: FSMContext):
     if message.from_user.id != SUPER_ADMIN:
@@ -1122,6 +1320,41 @@ async def process_blacklist_add(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Error adding to blacklist: {e}")
         await message.answer("❌ Ошибка при добавлении слова")
+    
+    await state.clear()
+
+@dp.message(AdminStates.waiting_for_blacklist_remove)
+async def process_blacklist_remove(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    
+    word = message.text.strip().lower()
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "DELETE FROM blacklist WHERE word=?",
+                (word,)
+            )
+            await db.commit()
+            
+            if cursor.rowcount > 0:
+                if word in blacklist_cache:
+                    del blacklist_cache[word]
+                await message.answer(f"✅ Слово <code>{word}</code> удалено из черного списка")
+                await log_admin_action(message.from_user.id, "blacklist_remove", details=word)
+            else:
+                await message.answer(f"❌ Слово <code>{word}</code> не найдено в черном списке")
+        
+    except Exception as e:
+        logger.error(f"Error removing from blacklist: {e}")
+        await message.answer("❌ Ошибка при удалении слова")
     
     await state.clear()
 
@@ -1158,15 +1391,21 @@ async def process_mute_user(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_mute_duration)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 час", callback_data="mute_1h"),
-         InlineKeyboardButton(text="3 часа", callback_data="mute_3h"),
-         InlineKeyboardButton(text="6 часов", callback_data="mute_6h")],
-        [InlineKeyboardButton(text="12 часов", callback_data="mute_12h"),
-         InlineKeyboardButton(text="1 день", callback_data="mute_1d"),
-         InlineKeyboardButton(text="3 дня", callback_data="mute_3d")],
-        [InlineKeyboardButton(text="7 дней", callback_data="mute_7d"),
-         InlineKeyboardButton(text="30 дней", callback_data="mute_30d"),
-         InlineKeyboardButton(text="❌ Отмена", callback_data="mute_cancel")]
+        [
+            InlineKeyboardButton(text="1 час", callback_data="mute_1h"),
+            InlineKeyboardButton(text="3 часа", callback_data="mute_3h"),
+            InlineKeyboardButton(text="6 часов", callback_data="mute_6h")
+        ],
+        [
+            InlineKeyboardButton(text="12 часов", callback_data="mute_12h"),
+            InlineKeyboardButton(text="1 день", callback_data="mute_1d"),
+            InlineKeyboardButton(text="3 дня", callback_data="mute_3d")
+        ],
+        [
+            InlineKeyboardButton(text="7 дней", callback_data="mute_7d"),
+            InlineKeyboardButton(text="30 дней", callback_data="mute_30d"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="mute_cancel")
+        ]
     ])
     
     await message.answer(
@@ -1219,8 +1458,6 @@ async def process_mute_duration(callback: CallbackQuery, state: FSMContext):
             
             if user_id in user_cache:
                 del user_cache[user_id]
-            if "stats" in admin_cache:
-                del admin_cache["stats"]
             
             await callback.message.edit_text(
                 f"✅ Пользователь <code>{user_id}</code> получил мут на {duration_text[callback.data]}\n"
@@ -1286,7 +1523,8 @@ async def show_admin_history(message: Message):
             "approve": "✅", "reject": "❌", "mute": "🔇", "ban": "🔨",
             "unban": "✅", "unmute": "🔊", "skip": "⏭",
             "blacklist_add": "📝➕", "blacklist_remove": "📝➖",
-            "temporary_mute": "⏳", "reply": "💬"
+            "temporary_mute": "⏳", "reply": "💬",
+            "approve_watermark": "✅➕"
         }.get(action, "📌")
         
         target_text = f" <code>{target_id}</code>" if target_id else ""
@@ -1306,6 +1544,46 @@ async def show_admin_history(message: Message):
         await message.answer(text, reply_markup=keyboard)
     else:
         await message.answer(text)
+
+@dp.callback_query(F.data == "export_history")
+async def export_history(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("""
+                SELECT admin_id, action, target_id, details, created_at
+                FROM admin_actions
+                ORDER BY created_at DESC
+                LIMIT 100
+            """)
+            actions = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Error exporting history: {e}")
+        await callback.answer("❌ Ошибка экспорта")
+        return
+    
+    text = "Дата;Админ;Действие;Цель;Детали\n"
+    for admin_id, action, target_id, details, created_at in actions:
+        try:
+            action_date = datetime.fromisoformat(created_at)
+            date_str = action_date.strftime('%Y-%m-%d %H:%M')
+        except:
+            date_str = created_at[:16] if created_at else "неизвестно"
+        
+        text += f"{date_str};{admin_id};{action};{target_id or ''};{details or ''}\n"
+    
+    import io
+    file = io.BytesIO(text.encode('utf-8'))
+    file.name = "admin_history.txt"
+    
+    await callback.message.answer_document(
+        document=('admin_history.txt', file),
+        caption="📊 Полная история действий"
+    )
+    
+    await callback.answer()
 
 # ================= ТЕХРАБОТЫ =================
 
@@ -1353,6 +1631,7 @@ async def toggle_night_mode(message: Message):
     
     status = "включен" if night_mode_enabled else "выключен"
     await message.answer(f"🌙 Ночной режим {status}")
+    await log_admin_action(message.from_user.id, "night_mode_toggle", details=status)
 
 # ================= ПОИСК ПОЛЬЗОВАТЕЛЯ =================
 
@@ -1461,25 +1740,169 @@ async def process_user_search(message: Message, state: FSMContext):
     
     await state.clear()
 
+# ================= СПИСОК ЗАБАНЕННЫХ =================
+
+@dp.callback_query(F.data == "list_banned")
+async def list_banned(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT user_id, username, first_name FROM users WHERE banned=1 ORDER BY user_id DESC LIMIT 20"
+            )
+            banned_users = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in list_banned: {e}")
+        await callback.answer("❌ Ошибка получения списка")
+        return
+    
+    if not banned_users:
+        await callback.message.answer("📋 Список забаненных пуст")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>Забаненные пользователи (последние 20):</b>\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for user_id, username, first_name in banned_users:
+        display_name = first_name if first_name else "без имени"
+        if len(display_name) > 15:
+            display_name = display_name[:15] + "..."
+        
+        text += f"• {display_name} (@{username or 'нет'}) - <code>{user_id}</code>\n"
+        
+        if callback.from_user.id == SUPER_ADMIN:
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"✅ Разбанить {user_id}", 
+                    callback_data=f"unban_{user_id}"
+                )
+            ])
+    
+    if keyboard.inline_keyboard:
+        await callback.message.answer(text, reply_markup=keyboard)
+    else:
+        await callback.message.answer(text)
+    
+    await callback.answer()
+
+# ================= СПИСОК ЗАМУЧЕННЫХ =================
+
+@dp.callback_query(F.data == "list_muted")
+async def list_muted(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("""
+                SELECT user_id, username, first_name, mute_until 
+                FROM users 
+                WHERE mute_until > datetime('now') 
+                ORDER BY mute_until DESC 
+                LIMIT 20
+            """)
+            muted_users = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in list_muted: {e}")
+        await callback.answer("❌ Ошибка получения списка")
+        return
+    
+    if not muted_users:
+        await callback.message.answer("📋 Список замученных пуст")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>Пользователи в муте (последние 20):</b>\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for user_id, username, first_name, mute_until in muted_users:
+        display_name = first_name if first_name else "без имени"
+        if len(display_name) > 15:
+            display_name = display_name[:15] + "..."
+        
+        try:
+            mute_date = datetime.fromisoformat(mute_until)
+            date_str = mute_date.strftime('%d.%m.%Y %H:%M')
+        except:
+            date_str = mute_until[:16] if mute_until else "неизвестно"
+        
+        text += f"• {display_name} (@{username or 'нет'}) - <code>{user_id}</code>\n  до {date_str}\n"
+        
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"🔊 Размутить {user_id}", 
+                callback_data=f"unmute_{user_id}"
+            )
+        ])
+    
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer()
+
+# ================= ОБРАБОТЧИКИ UNBAN/UNMUTE =================
+
+@dp.callback_query(F.data.startswith("unban_"))
+async def unban_user(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        await callback.answer("❌ Только главный админ", show_alert=True)
+        return
+
+    user_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as db:
+        await db.execute("UPDATE users SET banned=0 WHERE user_id=?", (user_id,))
+        await db.commit()
+
+    if user_id in user_cache:
+        del user_cache[user_id]
+
+    await callback.message.edit_text(f"✅ Пользователь {user_id} разбанен")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("unmute_"))
+async def unmute_user(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as db:
+        await db.execute("UPDATE users SET mute_until=NULL WHERE user_id=?", (user_id,))
+        await db.commit()
+
+    if user_id in user_cache:
+        del user_cache[user_id]
+
+    await callback.message.edit_text(f"✅ Пользователь {user_id} размучен")
+    await callback.answer()
+
 # ================= ОБРАБОТЧИК СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ =================
 
 @dp.message(F.photo | F.video | F.text)
 async def handle_user_media(message: Message, state: FSMContext):
+    """Обработка сообщений от обычных пользователей"""
+    
+    # Пропускаем админов
+    if message.from_user.id in ADMINS:
+        return
+
+    # Проверяем, не в состоянии ли FSM
     current_state = await state.get_state()
     if current_state is not None:
         return
-    
-    if message.from_user.id in ADMINS:
+
+    # Игнорируем команды и кнопки меню
+    if message.text and (message.text.startswith('/') or message.text in 
+        ["🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями", 
+         "📨 Ожидающие проверки", "❌ Закрыть меню", "ℹ Информация", "❓ Помощь",
+         "⏳ Временный мут", "📋 История действий", "📝 Черный список слов",
+         "📩 Написать админу", "❌ Отмена"]):
         return
-    
-    if message.text and message.text.startswith('/'):
-        return
-    
-    if message.text and message.text in ["🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями", 
-                        "📨 Ожидающие проверки", "❌ Закрыть меню", "ℹ Информация", "❓ Помощь",
-                        "⏳ Временный мут", "📋 История действий", "📝 Черный список слов"]:
-        return
-    
+
+    # Проверяем техработы
     if maintenance_mode:
         try:
             async with db_pool.acquire() as db:
@@ -1497,8 +1920,7 @@ async def handle_user_media(message: Message, state: FSMContext):
     now = datetime.utcnow()
     user_id = message.from_user.id
 
-    log_user_action(user_id, "SEND_MESSAGE", f"Type: {'photo' if message.photo else 'video' if message.video else 'text'}")
-
+    # Проверяем кэш пользователя
     if user_id in user_cache:
         user_data = user_cache[user_id]
         if user_data.get('banned'):
@@ -1512,6 +1934,7 @@ async def handle_user_media(message: Message, state: FSMContext):
             await message.answer("⏳ Подождите 30 секунд.")
             return
 
+    # Проверяем БД
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
@@ -1546,13 +1969,12 @@ async def handle_user_media(message: Message, state: FSMContext):
                     except:
                         pass
 
+            # Определяем тип медиа
             media_type = None
             media_file_id = None
             text = message.caption if message.caption else message.text
             
-            formatted_text = None
-            if text:
-                formatted_text = f"<blockquote>{text}</blockquote>"
+            formatted_text = f"<blockquote>{text}</blockquote>" if text else None
             
             if message.photo:
                 media_type = "photo"
@@ -1561,10 +1983,12 @@ async def handle_user_media(message: Message, state: FSMContext):
                 media_type = "video"
                 media_file_id = message.video.file_id
 
+            # Проверки
             has_links_flag = has_links(text) if text else False
             insult_count = count_insults_with_blacklist(text) if text else 0
             has_immoral_flag = has_immoral_content(text) if text else False
 
+            # Сохраняем пользователя
             await db.execute("""
                 INSERT INTO users (user_id, username, first_name, last_message) 
                 VALUES (?, ?, ?, ?)
@@ -1574,6 +1998,7 @@ async def handle_user_media(message: Message, state: FSMContext):
                     last_message=excluded.last_message
             """, (user_id, message.from_user.username, message.from_user.first_name, now.isoformat()))
 
+            # Сохраняем сообщение
             cursor = await db.execute("""
                 INSERT INTO messages 
                 (user_id, text, media_type, media_file_id, created_at, has_links, insult_count) 
@@ -1588,14 +2013,15 @@ async def handle_user_media(message: Message, state: FSMContext):
         await message.answer("❌ Ошибка при сохранении сообщения")
         return
 
-    logger.info(f"MESSAGE SAVED: #{msg_id} from user {user_id}")
-
+    # Обновляем кэш
     user_cache[user_id] = {'banned': False, 'mute_until': None, 'last_message': now}
-    
+
+    # Очищаем кэш
     if "stats" in admin_cache:
         del admin_cache["stats"]
     pending_cache.clear()
 
+    # Подтверждение пользователю
     if media_type == "photo":
         await message.answer("✅ Фото отправлено на модерацию.")
     elif media_type == "video":
@@ -1603,10 +2029,12 @@ async def handle_user_media(message: Message, state: FSMContext):
     else:
         await message.answer("✅ Сообщение отправлено на модерацию.")
 
+    # Отправляем админам
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Перейти к рассмотрению", callback_data=f"review_{msg_id}")]
     ])
 
+    # Предупреждения
     warnings = []
     if has_links_flag:
         warnings.append("🔗 ССЫЛКИ")
@@ -1615,7 +2043,7 @@ async def handle_user_media(message: Message, state: FSMContext):
     if has_immoral_flag:
         warnings.append("🔞 АМОРАЛЬНЫЙ КОНТЕНТ")
     if media_type:
-        warnings.append("🚫 МЕДИА (только ручная проверка)")
+        warnings.append("🚫 МЕДИА")
     
     warning_text = f"\n\n⚠️ {' | '.join(warnings)}" if warnings else ""
     display_text = formatted_text if formatted_text else (text or "без текста")
@@ -1661,6 +2089,118 @@ async def handle_user_media(message: Message, state: FSMContext):
                 await asyncio.sleep(0.2)
             except Exception as e:
                 logger.error(f"Error sending to admin: {e}")
+
+# ================= ОТВЕТЫ НА СООБЩЕНИЯ (НОВАЯ СИСТЕМА) =================
+
+# Словарь для временного хранения ответов (НЕ FSM!)
+reply_storage = {}  # {admin_id: {"user_id": int, "msg_id": int, "type": str}}
+
+@dp.callback_query(F.data.startswith("reply_"))
+async def reply_to_message(callback: CallbackQuery):
+    """Начать ответ на сообщение"""
+    if callback.from_user.id not in ADMINS:
+        return
+
+    msg_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as db:
+        cursor = await db.execute(
+            "SELECT user_id FROM messages WHERE id=?",
+            (msg_id,)
+        )
+        result = await cursor.fetchone()
+        
+    if not result:
+        await callback.answer("❌ Сообщение не найдено", show_alert=True)
+        return
+
+    user_id = result[0]
+    
+    # Сохраняем в отдельный словарь
+    reply_storage[callback.from_user.id] = {
+        "user_id": user_id,
+        "msg_id": msg_id,
+        "type": "message"
+    }
+    
+    await callback.message.answer(
+        f"📝 Введите текст ответа для пользователя <code>{user_id}</code>\n"
+        f"(или отправьте /cancel для отмены)"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adminmsg_reply_"))
+async def admin_message_reply(callback: CallbackQuery):
+    """Ответ на личное сообщение"""
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    
+    # Сохраняем в отдельный словарь
+    reply_storage[callback.from_user.id] = {
+        "user_id": user_id,
+        "type": "admin_message"
+    }
+    
+    await callback.message.answer(
+        f"📝 Введите текст ответа для пользователя <code>{user_id}</code>\n"
+        f"(или отправьте /cancel для отмены)"
+    )
+    await callback.answer()
+
+
+@dp.message()
+async def handle_reply_input(message: Message):
+    """Обрабатывает ввод ответа от админа"""
+    
+    # Проверяем, есть ли админ в режиме ответа
+    if message.from_user.id not in reply_storage:
+        return  # Не в режиме ответа, пропускаем дальше к другим обработчикам
+    
+    # Проверка на отмену
+    if message.text == "/cancel":
+        del reply_storage[message.from_user.id]
+        await message.answer("❌ Ответ отменён")
+        return  # Завершаем обработку
+    
+    # Получаем данные
+    data = reply_storage[message.from_user.id]
+    user_id = data["user_id"]
+    
+    if not user_id:
+        del reply_storage[message.from_user.id]
+        await message.answer("❌ Ошибка: пользователь не найден")
+        return
+    
+    # Отправляем ответ
+    try:
+        await bot.send_message(
+            user_id,
+            f"📝 <b>Ответ от администратора</b>\n\n{message.text}"
+        )
+        
+        # Если это ответ на личное сообщение, обновляем статус
+        if data.get("type") == "admin_message":
+            async with db_pool.acquire() as db:
+                await db.execute(
+                    "UPDATE admin_messages SET status='replied' WHERE user_id=? AND status='new'",
+                    (user_id,)
+                )
+                await db.commit()
+        
+        await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
+        await log_admin_action(message.from_user.id, "reply", user_id)
+        
+    except Exception as e:
+        logger.error(f"Reply error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    
+    # Удаляем из хранилища
+    del reply_storage[message.from_user.id]
+    # НЕ ВОЗВРАЩАЕМ! Сообщение должно идти дальше к другим обработчикам
+    return
 
 # ================= ПРОСМОТР СООБЩЕНИЯ =================
 
@@ -1720,15 +2260,44 @@ async def review(callback: CallbackQuery):
 
     msg_cache[cache_key] = callback.from_user.id
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{msg_id}"),
-         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{msg_id}")],
-        [InlineKeyboardButton(text="⏳ Мут 7д", callback_data=f"mute_{msg_id}"),
-         InlineKeyboardButton(text="🔨 Бан", callback_data=f"ban_{msg_id}")],
-        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"skip_{msg_id}"),
-         InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{msg_id}")],
-        [InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel_review_{msg_id}")]
-    ])
+    # Создаем клавиатуру
+    if media_type == "photo":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{msg_id}"),
+                InlineKeyboardButton(text="✅➕ Водяной знак", callback_data=f"watermark_{msg_id}")
+            ],
+            [
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{msg_id}"),
+                InlineKeyboardButton(text="⏳ Мут 7д", callback_data=f"mute_{msg_id}")
+            ],
+            [
+                InlineKeyboardButton(text="🔨 Бан", callback_data=f"ban_{msg_id}"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"skip_{msg_id}")
+            ],
+            [
+                InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{msg_id}"),
+                InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel_review_{msg_id}")
+            ]
+        ])
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{msg_id}")
+            ],
+            [
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{msg_id}"),
+                InlineKeyboardButton(text="⏳ Мут 7д", callback_data=f"mute_{msg_id}")
+            ],
+            [
+                InlineKeyboardButton(text="🔨 Бан", callback_data=f"ban_{msg_id}"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"skip_{msg_id}")
+            ],
+            [
+                InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{msg_id}"),
+                InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel_review_{msg_id}")
+            ]
+        ])
 
     warnings = []
     if has_links:
@@ -1754,9 +2323,8 @@ async def review(callback: CallbackQuery):
                 parse_mode=ParseMode.HTML
             )
         else:
-            reply_hint = "\n\n💬 <i>Чтобы ответить пользователю, нажмите кнопку 'Ответить'</i>"
             await callback.message.edit_text(
-                text=callback.message.text + warning_text + reply_hint + "\n\n🔄 <b>Рассматривается...</b>",
+                text=callback.message.text + warning_text + "\n\n🔄 <b>Рассматривается...</b>",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
@@ -1765,73 +2333,92 @@ async def review(callback: CallbackQuery):
         await callback.answer("❌ Ошибка при редактировании", show_alert=True)
         return
 
-# ================= ОТВЕТ ПОЛЬЗОВАТЕЛЮ =================
+# ================= ВОДЯНОЙ ЗНАК =================
 
-@dp.callback_query(F.data.startswith("reply_"))
-async def reply_to_user(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("watermark_"))
+async def approve_with_watermark(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
-    
+
     msg_id = int(callback.data.split("_")[1])
-    await state.update_data(reply_msg_id=msg_id)
-    await state.set_state(AdminStates.waiting_for_reply)
-    
-    await callback.message.answer(
-        "💬 Введите текст ответа пользователю (или /cancel для отмены):"
+
+    async with db_pool.acquire() as db:
+        cursor = await db.execute(
+            "SELECT text, user_id, reviewer, media_type, media_file_id FROM messages WHERE id=?",
+            (msg_id,)
+        )
+        result = await cursor.fetchone()
+        if not result:
+            await callback.answer("❌ Сообщение не найдено", show_alert=True)
+            return
+
+        text, user_id, reviewer, media_type, media_file_id = result
+
+        if reviewer != callback.from_user.id:
+            await callback.answer("❌ Сначала нужно начать рассмотрение", show_alert=True)
+            return
+
+        if media_type != "photo":
+            await callback.answer("❌ Водяной знак только для фото", show_alert=True)
+            return
+
+        try:
+            new_file_id = await add_watermark_to_photo(media_file_id)
+        except Exception as e:
+            logger.error(f"Watermark error: {e}")
+            await callback.answer("❌ Ошибка при наложении водяного знака", show_alert=True)
+            return
+
+        # Получаем стиль и счетчик
+        async with db_pool.acquire() as db2:
+            cursor = await db2.execute("SELECT value FROM settings WHERE key='post_style'")
+            style = (await cursor.fetchone())[0]
+            cursor = await db2.execute("SELECT value FROM settings WHERE key='post_counter'")
+            counter = int((await cursor.fetchone())[0]) + 1
+            await db2.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
+            
+            await db2.execute(
+                "UPDATE messages SET status='approved', reviewed_at=? WHERE id=?",
+                (datetime.utcnow().isoformat(), msg_id)
+            )
+            await db2.commit()
+
+    # Форматируем пост
+    if style == "1":
+        header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
+        footer = f"\n\n━━━━━━━━━━━━━━\n✉ <a href='https://t.me/{BOT_USERNAME}'>Отправить сообщение</a>"
+    elif style == "2":
+        header = f"┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
+        footer = f"\n\n➖➖➖➖➖➖➖➖➖\n✉ <a href='https://t.me/{BOT_USERNAME}'>Написать анонимно</a>"
+    else:
+        header = f"📌 <b>Анонимное сообщение</b>\n\n"
+        footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
+
+    # Публикуем
+    await bot.send_photo(
+        CHANNEL_ID,
+        photo=new_file_id,
+        caption=f"{header}{text or ''}{footer}",
+        parse_mode=ParseMode.HTML
     )
+
+    # Удаляем сообщение админа или просто отвечаем
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    await callback.message.answer(f"✅ Фото #{msg_id} опубликовано с водяным знаком (@podslu10)")
+
+    try:
+        await bot.send_message(user_id, "✅ Ваше фото опубликовано в канале с водяным знаком!")
+    except:
+        pass
+
+    await log_admin_action(callback.from_user.id, "approve_watermark", target_id=msg_id)
     await callback.answer()
 
-@dp.message(AdminStates.waiting_for_reply)
-async def process_reply(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
-        await state.clear()
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("❌ Ответ отменен")
-        return
-    
-    data = await state.get_data()
-    msg_id = data.get("reply_msg_id")
-    
-    if not msg_id:
-        await state.clear()
-        await message.answer("❌ Ошибка: сообщение не найдено")
-        return
-    
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT user_id FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
-            if not result:
-                await message.answer("❌ Сообщение не найдено в базе")
-                await state.clear()
-                return
-            user_id = result[0]
-    except Exception as e:
-        logger.error(f"Error getting user_id: {e}")
-        await message.answer("❌ Ошибка базы данных")
-        await state.clear()
-        return
-    
-    try:
-        await bot.send_message(
-            user_id,
-            f"📝 <b>Ответ от администратора</b>\n\n{message.text}"
-        )
-        await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
-        await log_admin_action(message.from_user.id, "reply", user_id, message.text[:100])
-    except Exception as e:
-        logger.error(f"Error sending reply: {e}")
-        await message.answer(f"❌ Не удалось отправить ответ. Пользователь {user_id} заблокировал бота?")
-    
-    await state.clear()
-
-# ================= ПРОПУСК СООБЩЕНИЯ =================
+# ================= ПРОПУСК =================
 
 @dp.callback_query(F.data.startswith("skip_"))
 async def skip_message(callback: CallbackQuery):
@@ -1897,6 +2484,15 @@ async def confirm_skip(callback: CallbackQuery):
     await callback.message.delete()
     await callback.message.answer(f"✅ Сообщение #{msg_id} пропущено")
     await log_admin_action(callback.from_user.id, "skip", target_id=msg_id)
+
+@dp.callback_query(F.data.startswith("cancel_skip_"))
+async def cancel_skip(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    msg_id = int(callback.data.split("_")[2])
+    await callback.message.delete()
+    await callback.message.answer(f"❌ Пропуск сообщения #{msg_id} отменен")
+    await callback.answer()
 
 # ================= ОТМЕНА РАССМОТРЕНИЯ =================
 
@@ -2080,12 +2676,7 @@ async def approve(callback: CallbackQuery):
         pass
     
     try:
-        if media_type == "photo":
-            await bot.send_message(user_id, "✅ Ваше фото опубликовано в канале!")
-        elif media_type == "video":
-            await bot.send_message(user_id, "✅ Ваше видео опубликовано в канале!")
-        else:
-            await bot.send_message(user_id, "✅ Ваше сообщение опубликовано в канале!")
+        await bot.send_message(user_id, "✅ Ваше сообщение опубликовано в канале!")
     except:
         pass
 
@@ -2156,12 +2747,7 @@ async def reject(callback: CallbackQuery):
         pass
     
     try:
-        if media_type == "photo":
-            await bot.send_message(user_id, "❌ Ваше фото отклонено модератором.")
-        elif media_type == "video":
-            await bot.send_message(user_id, "❌ Ваше видео отклонено модератором.")
-        else:
-            await bot.send_message(user_id, "❌ Ваше сообщение отклонено модератором.")
+        await bot.send_message(user_id, "❌ Ваше сообщение отклонено модератором.")
     except:
         pass
 
@@ -2234,7 +2820,7 @@ async def mute(callback: CallbackQuery):
         pass
 
     try:
-        await bot.send_message(user_id, f"⏳ Вы получили мут на 7 дней за нарушение правил.\nДо: {mute_until.strftime('%d.%m.%Y %H:%M')} МСК")
+        await bot.send_message(user_id, f"⏳ Вы получили мут на 7 дней за нарушение правил.")
     except:
         pass
 
@@ -2353,8 +2939,6 @@ async def confirm_ban(callback: CallbackQuery):
 
     if user_id in user_cache:
         del user_cache[user_id]
-    if "stats" in admin_cache:
-        del admin_cache["stats"]
 
     await callback.message.edit_text(f"✅ Бан пользователя {user_id} подтвержден")
     
@@ -2368,67 +2952,6 @@ async def cancel_ban(callback: CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN:
         return
     await callback.message.edit_text("❌ Бан отменен")
-
-# ================= РАЗБАН =================
-
-@dp.callback_query(F.data.startswith("unban_"))
-async def unban_user(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
-        await callback.answer("❌ Только главный админ может разбанивать", show_alert=True)
-        return
-    
-    user_id = int(callback.data.split("_")[1])
-    
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute("UPDATE users SET banned=0 WHERE user_id=?", (user_id,))
-            await db.commit()
-    except Exception as e:
-        logger.error(f"DB error in unban: {e}")
-        await callback.answer("❌ Ошибка базы данных", show_alert=True)
-        return
-    
-    if user_id in user_cache:
-        del user_cache[user_id]
-    if "stats" in admin_cache:
-        del admin_cache["stats"]
-    
-    await callback.message.edit_text(f"✅ Пользователь {user_id} разбанен")
-    
-    try:
-        await bot.send_message(user_id, "✅ Ваш бан снят. Теперь вы снова можете отправлять сообщения.")
-    except:
-        pass
-
-# ================= РАЗМУТ =================
-
-@dp.callback_query(F.data.startswith("unmute_"))
-async def unmute_user(callback: CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return
-    
-    user_id = int(callback.data.split("_")[1])
-    
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute("UPDATE users SET mute_until=NULL WHERE user_id=?", (user_id,))
-            await db.commit()
-    except Exception as e:
-        logger.error(f"DB error in unmute: {e}")
-        await callback.answer("❌ Ошибка базы данных", show_alert=True)
-        return
-    
-    if user_id in user_cache:
-        del user_cache[user_id]
-    if "stats" in admin_cache:
-        del admin_cache["stats"]
-    
-    await callback.message.edit_text(f"✅ Пользователь {user_id} размучен")
-    
-    try:
-        await bot.send_message(user_id, "✅ Ваш мут снят. Теперь вы снова можете отправлять сообщения.")
-    except:
-        pass
 
 # ================= СМЕНА СТИЛЯ =================
 
@@ -2457,6 +2980,231 @@ async def set_style(callback: CallbackQuery):
     styles = {"1": "Обычный", "2": "С рамкой", "3": "Минимализм"}
     await callback.answer(f"Стиль изменен на {styles[style_num]}")
     await callback.message.edit_text(f"✅ Стиль успешно изменен на <b>{styles[style_num]}</b>")
+
+# ================= ОБНОВЛЕНИЕ СПИСКА ОЖИДАЮЩИХ =================
+
+@dp.callback_query(F.data == "refresh_pending")
+async def refresh_pending(callback: CallbackQuery):
+    """Обновить список ожидающих сообщений"""
+    if callback.from_user.id not in ADMINS:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE status='pending' AND skipped=0"
+            )
+            total_pending = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute("""
+                SELECT id, user_id, media_type, 
+                       substr(text, 1, 50) as short_text, 
+                       created_at, has_links, insult_count
+                FROM messages 
+                WHERE status='pending' AND skipped=0
+                ORDER BY created_at DESC 
+                LIMIT 10
+            """)
+            pending_messages = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in refresh_pending: {e}")
+        await callback.answer("❌ Ошибка обновления")
+        return
+    
+    if not pending_messages:
+        await callback.message.edit_text("📨 Нет сообщений, ожидающих проверки")
+        await callback.answer()
+        return
+    
+    text = f"📨 Ожидают проверки: {total_pending}\n\n"
+    if total_pending > 10:
+        text += f"Показаны последние 10 из {total_pending}\n\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count in pending_messages:
+        try:
+            msg_date = datetime.fromisoformat(created_at)
+            date_str = msg_date.strftime('%d.%m %H:%M')
+        except:
+            date_str = created_at[:16] if created_at else "неизвестно"
+        
+        if media_type == "photo":
+            emoji = "📸"
+            content_type = "Фото"
+        elif media_type == "video":
+            emoji = "🎥"
+            content_type = "Видео"
+        else:
+            emoji = "📝"
+            content_type = "Текст"
+        
+        warnings = []
+        if has_links:
+            warnings.append("🔗")
+        if insult_count >= INSULT_THRESHOLD:
+            warnings.append(f"🤬{insult_count}")
+        
+        warning_str = f" {' '.join(warnings)}" if warnings else ""
+        
+        display_text = short_text.replace('\n', ' ').strip() if short_text else "без текста"
+        if len(display_text) > 30:
+            display_text = display_text[:30] + "..."
+        
+        text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+        text += f"👤 ID: {user_id}\n"
+        text += f"💬 {display_text}\n\n"
+        
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"🔍 Рассмотреть #{msg_id} ({content_type})",
+                callback_data=f"review_{msg_id}"
+            )
+        ])
+    
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="🔄 Обновить список", callback_data="refresh_pending")
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+# ================= УПРАВЛЕНИЕ ИСКЛЮЧЕНИЯМИ =================
+
+@dp.message(F.text == "👥 Управление исключениями")
+async def manage_exceptions(message: Message):
+    if message.from_user.id != SUPER_ADMIN:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT user_id, username, first_name FROM users WHERE maintenance_exception=1 LIMIT 20"
+            )
+            exceptions = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in manage_exceptions: {e}")
+        exceptions = []
+    
+    text = "👥 Пользователи в исключении\n\n"
+    if exceptions:
+        for user_id, username, first_name in exceptions:
+            text += f"• {first_name or '?'} (@{username or 'нет'}) - ID: {user_id}\n"
+    else:
+        text += "Список пуст"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить в исключение", callback_data="add_exception")],
+        [InlineKeyboardButton(text="➖ Удалить из исключения", callback_data="remove_exception")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_exceptions")]
+    ])
+    
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "add_exception")
+async def add_exception_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    await state.set_state(AdminStates.waiting_for_exception_add)
+    await callback.message.answer(
+        "➕ Введите ID пользователя для добавления в исключение:\n(или отправьте /cancel для отмены)"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "remove_exception")
+async def remove_exception_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    await state.set_state(AdminStates.waiting_for_exception_remove)
+    await callback.message.answer(
+        "➖ Введите ID пользователя для удаления из исключения:\n(или отправьте /cancel для отмены)"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "close_exceptions")
+async def close_exceptions(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_exception_add)
+async def process_add_exception(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Некорректный ID. Введите число.")
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE users SET maintenance_exception=1 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+            
+            # Обновляем кэш
+            maintenance_exceptions.add(user_id)
+            
+        await message.answer(f"✅ Пользователь {user_id} добавлен в исключение")
+        await log_admin_action(message.from_user.id, "exception_add", user_id)
+        
+    except Exception as e:
+        logger.error(f"DB error in process_add_exception: {e}")
+        await message.answer("❌ Ошибка при добавлении в исключение")
+    
+    await state.clear()
+
+
+@dp.message(AdminStates.waiting_for_exception_remove)
+async def process_remove_exception(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Некорректный ID. Введите число.")
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE users SET maintenance_exception=0 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+            
+            # Обновляем кэш
+            if user_id in maintenance_exceptions:
+                maintenance_exceptions.remove(user_id)
+            
+        await message.answer(f"✅ Пользователь {user_id} удален из исключения")
+        await log_admin_action(message.from_user.id, "exception_remove", user_id)
+        
+    except Exception as e:
+        logger.error(f"DB error in process_remove_exception: {e}")
+        await message.answer("❌ Ошибка при удалении из исключения")
+    
+    await state.clear()
 
 # ================= ГЛАВНАЯ ФУНКЦИЯ =================
 
@@ -2504,8 +3252,6 @@ async def main():
         await asyncio.sleep(2)
         await db_pool.close_all()
         await bot.session.close()
-
-# ================= ЗАПУСК =================
 
 if __name__ == "__main__":
     try:
