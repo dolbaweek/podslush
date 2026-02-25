@@ -410,82 +410,97 @@ def is_night_time() -> bool:
         return NIGHT_MODE_START <= hour < NIGHT_MODE_END
     return hour >= NIGHT_MODE_START or hour < NIGHT_MODE_END
 
-# ================= ВОДЯНОЙ ЗНАК (ИСПРАВЛЕННЫЙ ДЛЯ RAILWAY) =================
+# ================= ВОДЯНОЙ ЗНАК (МЕЛКИЙ, МНОГО, ПОЛУПРОЗРАЧНЫЙ) =================
 
 async def add_watermark_to_photo(photo_file_id: str) -> str:
+    """
+    Накладывает множество мелких полупрозрачных водяных знаков @podslu10
+    """
     try:
+        # Скачиваем фото
         file = await bot.get_file(photo_file_id)
         photo_bytes = await bot.download_file(file.file_path)
 
+        # Открываем изображение
         img = Image.open(photo_bytes).convert("RGBA")
+        width, height = img.size
+
+        # Создаём слой для водяного знака
         txt = Image.new("RGBA", img.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt)
 
+        # Текст водяного знака
         text = "@podslu10"
         
-        # РАЗМЕР ШРИФТА: 20% от ширины (еще больше)
-        font_size = max(60, int(img.width * 0.2))
+        # МЕЛКИЙ ШРИФТ - 5-7% от ширины
+        font_size = max(20, int(width * 0.06))
         
-        # Пытаемся загрузить шрифт (разные варианты для Railway)
+        # Пробуем использовать разные шрифты
         font = None
-        fonts_to_try = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux/Railway
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",  # другой Linux
-            "arial.ttf",  # Windows
-            None  # дефолтный (но мы его масштабируем)
-        ]
-        
-        for font_path in fonts_to_try:
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
             try:
-                if font_path:
-                    font = ImageFont.truetype(font_path, font_size)
-                else:
-                    # Для дефолтного шрифта создаем свой масштабированный
-                    default_font = ImageFont.load_default()
-                    # Создаем временное изображение для измерения
-                    temp_img = Image.new('RGB', (1, 1))
-                    temp_draw = ImageDraw.Draw(temp_img)
-                    bbox = temp_draw.textbbox((0, 0), text, font=default_font)
-                    text_width = bbox[2] - bbox[0]
-                    # Масштабируем размер
-                    scale_factor = (img.width * 0.2) / text_width
-                    font_size_scaled = max(40, int(12 * scale_factor))
-                    try:
-                        # Пробуем создать увеличенный дефолтный шрифт
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", font_size_scaled)
-                    except:
-                        # Если совсем ничего нет, используем дефолтный с масштабированием
-                        font = default_font
-                break
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
             except:
-                continue
-        
-        if font is None:
-            font = ImageFont.load_default()
+                try:
+                    font = ImageFont.truetype("C:\\Windows\\Fonts\\Arial.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
 
         # Получаем размер текста
         bbox = draw.textbbox((0, 0), text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
-        # Позиция по центру
-        x = (img.width - text_width) // 2
-        y = (img.height - text_height) // 2
+        # ПОЛУПРОЗРАЧНЫЙ ЧЕРНЫЙ (50% прозрачности)
+        fill_color = (0, 0, 0, 128)  # 128 = 50% прозрачности
 
-        # Рисуем текст (жирный, с обводкой)
-        # Сначала черная обводка
-        for offset_x, offset_y in [(2,2), (-2,-2), (2,-2), (-2,2), (0,2), (2,0), (0,-2), (-2,0)]:
-            draw.text((x + offset_x, y + offset_y), text, font=font, fill=(0, 0, 0, 60))
+        # Рисуем МНОГО водяных знаков по всему изображению
+        # Отступы между знаками
+        step_x = text_width * 2
+        step_y = text_height * 3
         
-        # Потом белый текст
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 100))
+        # Начинаем с небольшим смещением
+        start_x = text_width // 2
+        start_y = text_height
+        
+        # Заполняем всю поверхность
+        for y in range(start_y, height - text_height, step_y):
+            for x in range(start_x, width - text_width, step_x):
+                # Немного случайного смещения для естественности
+                offset_x = int(text_width * 0.2) * (hash(f"{x}{y}") % 3 - 1)
+                offset_y = int(text_height * 0.2) * (hash(f"{x}{y}") % 3 - 1)
+                
+                draw.text(
+                    (x + offset_x, y + offset_y), 
+                    text, 
+                    font=font, 
+                    fill=fill_color
+                )
 
+        # Добавляем еще один слой со смещением для более плотного заполнения
+        for y in range(start_y + step_y//2, height - text_height, step_y):
+            for x in range(start_x + step_x//2, width - text_width, step_x):
+                offset_x = int(text_width * 0.2) * (hash(f"{x}{y}2") % 3 - 1)
+                offset_y = int(text_height * 0.2) * (hash(f"{x}{y}2") % 3 - 1)
+                
+                draw.text(
+                    (x + offset_x, y + offset_y), 
+                    text, 
+                    font=font, 
+                    fill=fill_color
+                )
+
+        # Объединяем
         watermarked = Image.alpha_composite(img, txt).convert("RGB")
 
+        # Сохраняем во временный файл
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
             temp_path = tmp_file.name
             watermarked.save(temp_path, format="JPEG", quality=95)
 
+        # Отправляем обратно в Telegram
         msg = await bot.send_photo(
             chat_id=SUPER_ADMIN,
             photo=FSInputFile(temp_path)
@@ -494,7 +509,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         new_file_id = msg.photo[-1].file_id
         os.unlink(temp_path)
         
-        logger.info(f"Watermark added successfully, size: {font_size}")
+        logger.info(f"Watermark pattern added, size: {font_size}px")
         return new_file_id
 
     except Exception as e:
