@@ -410,7 +410,7 @@ def is_night_time() -> bool:
         return NIGHT_MODE_START <= hour < NIGHT_MODE_END
     return hour >= NIGHT_MODE_START or hour < NIGHT_MODE_END
 
-# ================= ВОДЯНОЙ ЗНАК =================
+# ================= ВОДЯНОЙ ЗНАК (ИСПРАВЛЕННЫЙ ДЛЯ RAILWAY) =================
 
 async def add_watermark_to_photo(photo_file_id: str) -> str:
     try:
@@ -422,25 +422,63 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         draw = ImageDraw.Draw(txt)
 
         text = "@podslu10"
-        font_size = max(40, int(img.width * 0.15))
         
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except:
+        # РАЗМЕР ШРИФТА: 20% от ширины (еще больше)
+        font_size = max(60, int(img.width * 0.2))
+        
+        # Пытаемся загрузить шрифт (разные варианты для Railway)
+        font = None
+        fonts_to_try = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux/Railway
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",  # другой Linux
+            "arial.ttf",  # Windows
+            None  # дефолтный (но мы его масштабируем)
+        ]
+        
+        for font_path in fonts_to_try:
             try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+                if font_path:
+                    font = ImageFont.truetype(font_path, font_size)
+                else:
+                    # Для дефолтного шрифта создаем свой масштабированный
+                    default_font = ImageFont.load_default()
+                    # Создаем временное изображение для измерения
+                    temp_img = Image.new('RGB', (1, 1))
+                    temp_draw = ImageDraw.Draw(temp_img)
+                    bbox = temp_draw.textbbox((0, 0), text, font=default_font)
+                    text_width = bbox[2] - bbox[0]
+                    # Масштабируем размер
+                    scale_factor = (img.width * 0.2) / text_width
+                    font_size_scaled = max(40, int(12 * scale_factor))
+                    try:
+                        # Пробуем создать увеличенный дефолтный шрифт
+                        font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", font_size_scaled)
+                    except:
+                        # Если совсем ничего нет, используем дефолтный с масштабированием
+                        font = default_font
+                break
             except:
-                font = ImageFont.load_default()
+                continue
+        
+        if font is None:
+            font = ImageFont.load_default()
 
+        # Получаем размер текста
         bbox = draw.textbbox((0, 0), text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
+        # Позиция по центру
         x = (img.width - text_width) // 2
         y = (img.height - text_height) // 2
 
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 200))
-        draw.text((x+2, y+2), text, font=font, fill=(0, 0, 0, 100))
+        # Рисуем текст (жирный, с обводкой)
+        # Сначала черная обводка
+        for offset_x, offset_y in [(2,2), (-2,-2), (2,-2), (-2,2), (0,2), (2,0), (0,-2), (-2,0)]:
+            draw.text((x + offset_x, y + offset_y), text, font=font, fill=(0, 0, 0, 180))
+        
+        # Потом белый текст
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 220))
 
         watermarked = Image.alpha_composite(img, txt).convert("RGB")
 
@@ -456,7 +494,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         new_file_id = msg.photo[-1].file_id
         os.unlink(temp_path)
         
-        logger.info(f"Watermark added successfully")
+        logger.info(f"Watermark added successfully, size: {font_size}")
         return new_file_id
 
     except Exception as e:
