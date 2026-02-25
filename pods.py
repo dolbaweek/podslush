@@ -475,10 +475,10 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         # Рисуем текст (жирный, с обводкой)
         # Сначала черная обводка
         for offset_x, offset_y in [(2,2), (-2,-2), (2,-2), (-2,2), (0,2), (2,0), (0,-2), (-2,0)]:
-            draw.text((x + offset_x, y + offset_y), text, font=font, fill=(0, 0, 0, 50))
+            draw.text((x + offset_x, y + offset_y), text, font=font, fill=(0, 0, 0, 60))
         
         # Потом белый текст
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 90))
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 100))
 
         watermarked = Image.alpha_composite(img, txt).convert("RGB")
 
