@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: podslush-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python pods.py
+    envVars:
+      - key: BOT_TOKEN
+        value: 8587934352:AAHdfiuD0VrNQ-Dp0801dYNnR7_nae92Aso
+      - key: CHANNEL_ID
+        value: -1003713957228
+      - key: SUPER_ADMIN
+        value: 8438783644
+      - key: ADMINS
+        value: 8438783644,8488564574,8283468381
+      - key: BOT_USERNAME
+        value: pods10_bot
