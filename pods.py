@@ -6,6 +6,8 @@ import aiosqlite
 from cachetools import TTLCache
 import os
 import re
+import time
+from datetime import timedelta
 import sys
 from contextlib import asynccontextmanager
 from PIL import Image, ImageDraw, ImageFont
@@ -67,6 +69,7 @@ night_mode_enabled = False
 maintenance_mode = False
 maintenance_exceptions = set()  # Только ОДНО определение!
 shutdown_flag = False
+start_time = time.time()
 
 # ================= БАЗОВЫЕ СПИСКИ СЛОВ =================
 
@@ -3267,16 +3270,49 @@ async def process_remove_exception(message: Message, state: FSMContext):
 # ================= ГЛАВНАЯ ФУНКЦИЯ =================
 
 async def run_http_server():
-    """Запускает простой HTTP-сервер для health checks Render"""
+    """Запускает HTTP-сервер для health checks и пинга"""
     try:
         from aiohttp import web
+        import time
+        from datetime import timedelta
         
         async def handle(request):
-            return web.Response(text="Bot is running")
+            # Считаем аптайм
+            uptime_seconds = time.time() - start_time
+            uptime_str = str(timedelta(seconds=int(uptime_seconds)))
+            
+            # Собираем статистику из БД
+            try:
+                async with db_pool.acquire() as db:
+                    cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE status='pending'")
+                    pending_count = (await cursor.fetchone())[0]
+                    
+                    cursor = await db.execute("SELECT COUNT(*) FROM users")
+                    users_count = (await cursor.fetchone())[0]
+            except:
+                pending_count = 0
+                users_count = 0
+            
+            return web.json_response({
+                "status": "ok",
+                "bot_name": BOT_USERNAME,
+                "uptime": uptime_str,
+                "users_in_cache": len(user_cache),
+                "pending_in_cache": len(pending_cache),
+                "pending_in_db": pending_count,
+                "total_users": users_count,
+                "night_mode": night_mode_enabled,
+                "maintenance": maintenance_mode,
+                "blacklist_size": len(blacklist_cache),
+                "timestamp": datetime.utcnow().isoformat()
+            })
         
         app = web.Application()
         app.router.add_get('/', handle)
         app.router.add_get('/health', handle)
+        app.router.add_get('/ping', handle)
+        app.router.add_get('/status', handle)
+        app.router.add_get('/stats', handle)
         
         runner = web.AppRunner(app)
         await runner.setup()
@@ -3285,7 +3321,10 @@ async def run_http_server():
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
         
-        logger.info(f"🌐 HTTP server started on port {port} for health checks")
+        logger.info(f"🌐 Advanced HTTP server started on port {port}")
+        logger.info(f"📊 Status page: http://localhost:{port}/status")
+        logger.info(f"🔗 Public URL: /health, /ping, /status, /stats")
+        
     except Exception as e:
         logger.error(f"Failed to start HTTP server: {e}")
 
