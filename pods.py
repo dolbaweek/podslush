@@ -410,11 +410,12 @@ def is_night_time() -> bool:
         return NIGHT_MODE_START <= hour < NIGHT_MODE_END
     return hour >= NIGHT_MODE_START or hour < NIGHT_MODE_END
 
-# ================= ВОДЯНОЙ ЗНАК (МЕЛКИЙ, МНОГО, ПОЛУПРОЗРАЧНЫЙ) =================
+# ================= ВОДЯНОЙ ЗНАК (15 ЗНАКОВ - 3 КОЛОНКИ ПО 5) =================
 
 async def add_watermark_to_photo(photo_file_id: str) -> str:
     """
-    Накладывает множество мелких полупрозрачных водяных знаков @podslu10
+    Накладывает мелкие полупрозрачные водяные знаки @podslu10
+    3 колонки по 5 знаков (слева, центр, справа)
     """
     try:
         # Скачиваем фото
@@ -432,8 +433,8 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         # Текст водяного знака
         text = "@podslu10"
         
-        # МЕЛКИЙ ШРИФТ - 5-7% от ширины
-        font_size = max(20, int(width * 0.06))
+        # МЕЛКИЙ ШРИФТ - 4% от ширины
+        font_size = max(16, int(width * 0.04))
         
         # Пробуем использовать разные шрифты
         font = None
@@ -454,39 +455,46 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         text_height = bbox[3] - bbox[1]
 
         # ПОЛУПРОЗРАЧНЫЙ ЧЕРНЫЙ (50% прозрачности)
-        fill_color = (0, 0, 0, 128)  # 128 = 50% прозрачности
+        fill_color = (0, 0, 0, 128)
 
-        # Рисуем МНОГО водяных знаков по всему изображению
-        # Отступы между знаками
-        step_x = text_width * 2
-        step_y = text_height * 3
-        
-        # Начинаем с небольшим смещением
-        start_x = text_width // 2
-        start_y = text_height
-        
-        # Заполняем всю поверхность
-        for y in range(start_y, height - text_height, step_y):
-            for x in range(start_x, width - text_width, step_x):
-                # Немного случайного смещения для естественности
-                offset_x = int(text_width * 0.2) * (hash(f"{x}{y}") % 3 - 1)
-                offset_y = int(text_height * 0.2) * (hash(f"{x}{y}") % 3 - 1)
+        # ПОЗИЦИИ ПО ГОРИЗОНТАЛИ - три колонки
+        positions_x = [
+            int(width * 0.15),  # слева (15% от края)
+            int(width * 0.5),   # центр
+            int(width * 0.85)   # справа (85% от края)
+        ]
+
+        # ПОЗИЦИИ ПО ВЕРТИКАЛИ - 5 знаков
+        positions_y = []
+        for i in range(5):
+            # Равномерно распределяем по высоте с отступами от краев
+            y = int(height * (0.1 + i * 0.2))  # 10%, 30%, 50%, 70%, 90%
+            positions_y.append(y)
+
+        # Заполняем все колонки
+        for col, x in enumerate(positions_x):
+            # Корректируем X для каждой колонки
+            if col == 0:  # левая колонка
+                x_final = int(width * 0.12)
+            elif col == 1:  # центр
+                x_final = int(width * 0.5)
+            else:  # правая колонка
+                x_final = int(width * 0.88)
+            
+            for row, y in enumerate(positions_y):
+                # Небольшое случайное смещение для каждой пары колонка/ряд
+                offset_x = int(text_width * 0.2) * (hash(f"{col}{row}") % 3 - 1)
+                offset_y = int(text_height * 0.2) * (hash(f"{col}{row}") % 3 - 1)
+                
+                final_x = x_final + offset_x
+                final_y = y + offset_y
+                
+                # Центрируем текст (чтобы центр текста был в нужной точке)
+                draw_x = final_x - text_width // 2
+                draw_y = final_y - text_height // 2
                 
                 draw.text(
-                    (x + offset_x, y + offset_y), 
-                    text, 
-                    font=font, 
-                    fill=fill_color
-                )
-
-        # Добавляем еще один слой со смещением для более плотного заполнения
-        for y in range(start_y + step_y//2, height - text_height, step_y):
-            for x in range(start_x + step_x//2, width - text_width, step_x):
-                offset_x = int(text_width * 0.2) * (hash(f"{x}{y}2") % 3 - 1)
-                offset_y = int(text_height * 0.2) * (hash(f"{x}{y}2") % 3 - 1)
-                
-                draw.text(
-                    (x + offset_x, y + offset_y), 
+                    (draw_x, draw_y), 
                     text, 
                     font=font, 
                     fill=fill_color
@@ -509,7 +517,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         new_file_id = msg.photo[-1].file_id
         os.unlink(temp_path)
         
-        logger.info(f"Watermark pattern added, size: {font_size}px")
+        logger.info(f"Watermark pattern added - 3 columns x 5 rows = 15 marks, size: {font_size}px")
         return new_file_id
 
     except Exception as e:
@@ -2447,7 +2455,7 @@ async def approve_with_watermark(callback: CallbackQuery):
         header = f"📌 <b>Анонимное сообщение</b>\n\n"
         footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
 
-    # Публикуем
+    # Публикуем ТОЛЬКО ОДИН РАЗ - фото с водяным знаком
     await bot.send_photo(
         CHANNEL_ID,
         photo=new_file_id,
@@ -2455,21 +2463,17 @@ async def approve_with_watermark(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
 
-    # Удаляем сообщение админа или просто отвечаем
-    try:
-        await callback.message.delete()
-    except:
-        pass
-    
-    await callback.message.answer(f"✅ Фото #{msg_id} опубликовано с водяным знаком (@podslu10)")
+    # Отвечаем админу, что всё ок
+    await callback.message.edit_text(f"✅ Фото #{msg_id} опубликовано с водяным знаком (@podslu10)")
+    await callback.answer()
 
+    # Уведомляем пользователя
     try:
         await bot.send_message(user_id, "✅ Ваше фото опубликовано в канале с водяным знаком!")
     except:
         pass
 
     await log_admin_action(callback.from_user.id, "approve_watermark", target_id=msg_id)
-    await callback.answer()
 
 # ================= ПРОПУСК =================
 
