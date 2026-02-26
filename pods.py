@@ -1,4 +1,5 @@
 import asyncio
+from aiohttp import web
 import logging
 from datetime import datetime, timedelta
 import aiosqlite
@@ -3262,6 +3263,30 @@ async def process_remove_exception(message: Message, state: FSMContext):
         await message.answer("❌ Ошибка при удалении из исключения")
     
     await state.clear()
+
+# ================= HTTP-ЗАГЛУШКА ДЛЯ RENDER =================
+
+async def handle_http(request):
+    """Обрабатывает HTTP-запросы от Render"""
+    return web.Response(text="Bot is running")
+
+async def run_http_server():
+    """Запускает простой HTTP-сервер для health checks"""
+    app = web.Application()
+    app.router.add_get('/', handle_http)
+    app.router.add_get('/health', handle_http)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    logger.info(f"🌐 HTTP server started on port {port} for health checks")
+
+# Запускаем HTTP-сервер в фоне
+asyncio.create_task(run_http_server())
 
 # ================= ГЛАВНАЯ ФУНКЦИЯ =================
 
