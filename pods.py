@@ -3264,31 +3264,30 @@ async def process_remove_exception(message: Message, state: FSMContext):
     
     await state.clear()
 
-# ================= HTTP-ЗАГЛУШКА ДЛЯ RENDER =================
-
-async def handle_http(request):
-    """Обрабатывает HTTP-запросы от Render"""
-    return web.Response(text="Bot is running")
+# ================= ГЛАВНАЯ ФУНКЦИЯ =================
 
 async def run_http_server():
-    """Запускает простой HTTP-сервер для health checks"""
-    app = web.Application()
-    app.router.add_get('/', handle_http)
-    app.router.add_get('/health', handle_http)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"🌐 HTTP server started on port {port} for health checks")
-
-# Запускаем HTTP-сервер в фоне
-asyncio.create_task(run_http_server())
-
-# ================= ГЛАВНАЯ ФУНКЦИЯ =================
+    """Запускает простой HTTP-сервер для health checks Render"""
+    try:
+        from aiohttp import web
+        
+        async def handle(request):
+            return web.Response(text="Bot is running")
+        
+        app = web.Application()
+        app.router.add_get('/', handle)
+        app.router.add_get('/health', handle)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        port = int(os.environ.get("PORT", 10000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"🌐 HTTP server started on port {port} for health checks")
+    except Exception as e:
+        logger.error(f"Failed to start HTTP server: {e}")
 
 async def main():
     global night_mode_enabled, maintenance_mode, shutdown_flag
@@ -3315,6 +3314,10 @@ async def main():
     asyncio.create_task(auto_post_messages())
     asyncio.create_task(check_long_pending_messages())
     asyncio.create_task(heartbeat())
+    
+    # ====== ЗАПУСКАЕМ HTTP-СЕРВЕР ДЛЯ RENDER ======
+    asyncio.create_task(run_http_server())
+    # ==============================================
     
     logger.info("=" * 50)
     logger.info(f"🤖 Бот запущен на Railway!")
