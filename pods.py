@@ -447,7 +447,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
     """
     Накладывает:
     - 15 мелких полупрозрачных текстовых знаков @podslu10 (3 колонки по 5)
-    - Почти прозрачное фото по центру (watermark_center.png)
+    - Полупрозрачное фото по центру (watermark_center.png) - теперь более заметное
     """
     try:
         # Скачиваем фото пользователя
@@ -465,7 +465,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         # Текст водяного знака
         text = "@podslu10"
         
-        # РАЗМЕР ШРИФТА - 4% от ширины (как в оригинале)
+        # РАЗМЕР ШРИФТА - 4% от ширины
         font_size = max(16, int(width * 0.04))
         
         # Пробуем использовать разные шрифты
@@ -486,8 +486,8 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
-        # ПРОЗРАЧНОСТЬ ТЕКСТА - возвращаем к исходной (50%)
-        fill_color = (0, 0, 0, 128)  # 50% opacity (как в оригинале)
+        # ПРОЗРАЧНОСТЬ ТЕКСТА - 50% (как в оригинале)
+        fill_color = (0, 0, 0, 128)  # 50% opacity
 
         # ПОЗИЦИИ ПО ГОРИЗОНТАЛИ - три колонки
         positions_x = [
@@ -505,14 +505,14 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         # Заполняем все колонки
         for col, x in enumerate(positions_x):
             for row, y in enumerate(positions_y):
-                # Небольшое случайное смещение для каждой пары колонка/ряд
+                # Небольшое случайное смещение
                 offset_x = int(text_width * 0.2) * (hash(f"{col}{row}") % 3 - 1)
                 offset_y = int(text_height * 0.2) * (hash(f"{col}{row}") % 3 - 1)
                 
                 final_x = x + offset_x
                 final_y = y + offset_y
                 
-                # Центрируем текст (чтобы центр текста был в нужной точке)
+                # Центрируем текст
                 draw_x = final_x - text_width // 2
                 draw_y = final_y - text_height // 2
                 
@@ -524,7 +524,6 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
                 )
 
         # ===== 2. ЦЕНТРАЛЬНОЕ ФОТО-ВСТАВКА =====
-        # Пытаемся загрузить центральный водяной знак
         center_watermark_path = "watermark_center.png"
         
         if os.path.exists(center_watermark_path):
@@ -532,26 +531,35 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
                 # Открываем центральный водяной знак
                 center_img = Image.open(center_watermark_path).convert("RGBA")
                 
-                # Рассчитываем размер для центрального знака (30% от ширины фото)
-                center_size = int(width * 0.3)
-                center_img = center_img.resize((center_size, center_size), Image.Resampling.LANCZOS)
+                # Получаем размеры центрального фото
+                c_width, c_height = center_img.size
                 
-                # Делаем центральный знак ПОЧТИ ПРОЗРАЧНЫМ (15% прозрачности)
+                # Рассчитываем размер для центрального знака (40% от ширины фото - чуть больше)
+                target_size = int(width * 0.4)
+                
+                # Сохраняем пропорции
+                ratio = min(target_size / c_width, target_size / c_height)
+                new_size = (int(c_width * ratio), int(c_height * ratio))
+                
+                # Изменяем размер с сохранением пропорций
+                center_img = center_img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # ДЕЛАЕМ ЦЕНТРАЛЬНЫЙ ЗНАК БОЛЕЕ ЗАМЕТНЫМ (40% прозрачности)
                 center_array = center_img.getdata()
                 new_center_array = []
                 for item in center_array:
-                    # Если пиксель не полностью прозрачный, делаем его прозрачным
+                    # Если пиксель не полностью прозрачный
                     if item[3] > 0:
-                        # Устанавливаем прозрачность 15% (38 из 255)
-                        new_center_array.append((item[0], item[1], item[2], 38))
+                        # Устанавливаем прозрачность 40% (102 из 255)
+                        new_center_array.append((item[0], item[1], item[2], 102))
                     else:
                         new_center_array.append(item)
                 
                 center_img.putdata(new_center_array)
                 
-                # Позиция для центрального знака (по центру фото)
-                center_x = (width - center_size) // 2
-                center_y = (height - center_size) // 2
+                # Позиция для центрального знака (строго по центру)
+                center_x = (width - new_size[0]) // 2
+                center_y = (height - new_size[1]) // 2
                 
                 # Создаем слой для центрального знака
                 center_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
@@ -560,11 +568,13 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
                 # Объединяем текстовый слой и центральный слой
                 combined_layer = Image.alpha_composite(txt_layer, center_layer)
                 
+                logger.info(f"✅ Center watermark added: size={new_size[0]}x{new_size[1]}, opacity=40%")
+                
             except Exception as e:
-                logger.error(f"Error adding center watermark: {e}")
+                logger.error(f"❌ Error adding center watermark: {e}")
                 combined_layer = txt_layer
         else:
-            logger.warning(f"Center watermark file {center_watermark_path} not found. Using only text watermarks.")
+            logger.warning(f"⚠️ Center watermark file {center_watermark_path} not found. Using only text watermarks.")
             combined_layer = txt_layer
 
         # Объединяем оригинал со всеми водяными знаками
@@ -584,12 +594,12 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         new_file_id = msg.photo[-1].file_id
         os.unlink(temp_path)
         
-        center_status = "with center photo" if os.path.exists(center_watermark_path) else "without center photo"
-        logger.info(f"Watermark added - 15 text marks (50% opacity) + {center_status}, size: {font_size}px")
+        center_status = "with center photo (40% opacity)" if os.path.exists(center_watermark_path) else "without center photo"
+        logger.info(f"✅ Watermark added - 15 text marks (50% opacity) + {center_status}, size: {font_size}px")
         return new_file_id
 
     except Exception as e:
-        logger.error(f"Watermark error: {e}")
+        logger.error(f"❌ Watermark error: {e}")
         return photo_file_id
 
 # ================= ЛОГИРОВАНИЕ =================
