@@ -47,8 +47,6 @@ logger = logging.getLogger(__name__)
 
 NIGHT_MODE_START = 0
 NIGHT_MODE_END = 8
-AUTO_MODE_START = 8
-AUTO_MODE_END = 0
 NIGHT_POST_INTERVAL = 30  # 30 минут ночью
 AUTO_POST_INTERVAL = 5     # 5 минут днём
 INSULT_THRESHOLD = 4
@@ -68,7 +66,8 @@ blacklist_cache = TTLCache(maxsize=1000, ttl=300)
 user_message_cooldown = TTLCache(maxsize=1000, ttl=1800)
 
 # Флаги
-night_mode_enabled = False
+night_mode_enabled = False  # Ночной режим (00:00-08:00, интервал 30 мин)
+auto_mode_enabled = False   # Автоматический режим (08:01-23:59, интервал 5 мин)
 maintenance_mode = False
 maintenance_exceptions = set()
 shutdown_flag = False
@@ -346,7 +345,6 @@ class AdminStates(StatesGroup):
     waiting_for_mute_duration = State()
     waiting_for_mute_user = State()
     waiting_for_admin_message = State()
-    # Убрал waiting_for_reply_text - используем словарь reply_storage
 
 # ================= ПУЛ БАЗЫ ДАННЫХ =================
 
@@ -421,20 +419,27 @@ def get_current_mode_and_interval():
     
     # Ночной режим: 00:00 - 08:00
     if hour < 8:
-        return 'night', NIGHT_POST_INTERVAL
+        if night_mode_enabled:
+            return 'night', NIGHT_POST_INTERVAL
+        else:
+            return 'night_disabled', NIGHT_POST_INTERVAL
     # Автоматический режим: 08:01 - 23:59
     else:
-        return 'auto', AUTO_POST_INTERVAL
+        if auto_mode_enabled:
+            return 'auto', AUTO_POST_INTERVAL
+        else:
+            return 'auto_disabled', AUTO_POST_INTERVAL
 
-def is_night_time() -> bool:
-    """Только для ночного режима (00:00 - 08:00)"""
-    mode, _ = get_current_mode_and_interval()
-    return mode == 'night'
-
-def is_auto_time() -> bool:
-    """Проверка на автоматический режим (08:01 - 23:59)"""
-    mode, _ = get_current_mode_and_interval()
-    return mode == 'auto'
+def can_auto_post_now() -> bool:
+    """Проверяет, можно ли сейчас публиковать автоматически"""
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + timedelta(hours=3)
+    hour = now_msk.hour
+    
+    if hour < 8:  # Ночное время
+        return night_mode_enabled
+    else:  # Дневное время
+        return auto_mode_enabled
 
 # ================= ВОДЯНОЙ ЗНАК (15 ТЕКСТОВЫХ + ЦЕНТРАЛЬНОЕ ФОТО) =================
 
@@ -460,8 +465,8 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         # Текст водяного знака
         text = "@podslu10"
         
-        # МЕЛКИЙ ШРИФТ - 3% от ширины (еще мельче)
-        font_size = max(12, int(width * 0.03))
+        # РАЗМЕР ШРИФТА - 4% от ширины (как в оригинале)
+        font_size = max(16, int(width * 0.04))
         
         # Пробуем использовать разные шрифты
         font = None
@@ -481,8 +486,8 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
-        # ОЧЕНЬ ПРОЗРАЧНЫЙ ЧЕРНЫЙ (15% прозрачности - едва заметный)
-        fill_color = (0, 0, 0, 38)  # 15% opacity (255 * 0.15 = 38)
+        # ПРОЗРАЧНОСТЬ ТЕКСТА - возвращаем к исходной (50%)
+        fill_color = (0, 0, 0, 128)  # 50% opacity (как в оригинале)
 
         # ПОЗИЦИИ ПО ГОРИЗОНТАЛИ - три колонки
         positions_x = [
@@ -531,14 +536,14 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
                 center_size = int(width * 0.3)
                 center_img = center_img.resize((center_size, center_size), Image.Resampling.LANCZOS)
                 
-                # Делаем центральный знак ПОЧТИ ПРОЗРАЧНЫМ (5-8% прозрачности)
+                # Делаем центральный знак ПОЧТИ ПРОЗРАЧНЫМ (15% прозрачности)
                 center_array = center_img.getdata()
                 new_center_array = []
                 for item in center_array:
-                    # Если пиксель не полностью прозрачный, делаем его очень прозрачным
+                    # Если пиксель не полностью прозрачный, делаем его прозрачным
                     if item[3] > 0:
-                        # Устанавливаем прозрачность 5-8% (13-20 из 255)
-                        new_center_array.append((item[0], item[1], item[2], 15))
+                        # Устанавливаем прозрачность 15% (38 из 255)
+                        new_center_array.append((item[0], item[1], item[2], 38))
                     else:
                         new_center_array.append(item)
                 
@@ -580,7 +585,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         os.unlink(temp_path)
         
         center_status = "with center photo" if os.path.exists(center_watermark_path) else "without center photo"
-        logger.info(f"Watermark added - 15 text marks + {center_status}, size: {font_size}px")
+        logger.info(f"Watermark added - 15 text marks (50% opacity) + {center_status}, size: {font_size}px")
         return new_file_id
 
     except Exception as e:
@@ -724,6 +729,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO settings VALUES('post_counter','0')")
         await db.execute("INSERT OR IGNORE INTO settings VALUES('post_style','1')")
         await db.execute("INSERT OR IGNORE INTO settings VALUES('night_mode','0')")
+        await db.execute("INSERT OR IGNORE INTO settings VALUES('auto_mode','0')")  # Новый флаг
         await db.execute("INSERT OR IGNORE INTO settings VALUES('maintenance','0')")
         await db.commit()
     
@@ -805,10 +811,10 @@ async def post_next_message():
             header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
             footer = f"\n\n━━━━━━━━━━━━━━\n✉ <a href='https://t.me/{BOT_USERNAME}'>Отправить сообщение</a>"
         elif style == "2":
-            header = f"┌─────────────────┐\n│  НОЧНОЕ ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
+            header = f"┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
             footer = f"\n\n➖➖➖➖➖➖➖➖➖\n✉ <a href='https://t.me/{BOT_USERNAME}'>Написать анонимно</a>"
         else:
-            header = f"🌙 <b>Ночное сообщение</b>\n\n"
+            header = f"📌 <b>Анонимное сообщение</b>\n\n"
             footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
         
         await bot.send_message(
@@ -818,24 +824,39 @@ async def post_next_message():
             disable_web_page_preview=True
         )
         
-        mode, _ = get_current_mode_and_interval()
+        # Определяем режим для уведомления
+        hour = (datetime.utcnow() + timedelta(hours=3)).hour
+        mode = 'night' if hour < 8 else 'auto'
+        
         await notify_admins_about_auto_post(msg_id, user_id, "текст", counter, mode)
         
     except Exception as e:
         logger.error(f"Ошибка авто-публикации: {e}")
 
 async def auto_post_messages():
-    global night_mode_enabled, shutdown_flag
+    global night_mode_enabled, auto_mode_enabled, shutdown_flag
+    last_post_time = 0
+    
     while not shutdown_flag:
         try:
-            if night_mode_enabled and not maintenance_mode:
-                mode, interval = get_current_mode_and_interval()
-                if mode in ['night', 'auto']:  # Работаем в обоих режимах
+            current_time = time.time()
+            
+            # Проверяем, можно ли публиковать сейчас
+            if can_auto_post_now() and not maintenance_mode:
+                # Получаем текущий интервал
+                _, interval = get_current_mode_and_interval()
+                
+                # Проверяем, прошло ли достаточно времени
+                if current_time - last_post_time >= interval * 60:
                     await post_next_message()
-            for _ in range(60):  # Проверяем каждую минуту
+                    last_post_time = current_time
+            
+            # Проверяем каждые 30 секунд
+            for _ in range(30):
                 if shutdown_flag:
                     break
                 await asyncio.sleep(1)
+                
         except Exception as e:
             logger.error(f"Ошибка в автоматическом режиме: {e}")
             await asyncio.sleep(5)
@@ -862,23 +883,30 @@ async def check_long_pending_messages():
                 for msg in old_messages:
                     msg_id, user_id, media_type, short_text, created_at = msg
                     
-                    text = (
-                        f"⚠️ <b>Долгое сообщение #{msg_id}</b>\n\n"
-                        f"Висит в очереди больше {LONG_MESSAGE_THRESHOLD} минут!\n"
-                        f"Тип: {media_type or 'текст'}\n"
-                        f"Время отправки: {created_at[:16]}\n"
-                        f"Текст: {short_text}"
-                    )
-                    
                     # Для SUPER_ADMIN показываем ID
-                    if admin == SUPER_ADMIN:
-                        text += f"\nОт пользователя: <code>{user_id}</code>"
-                    
-                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="🔍 Перейти к рассмотрению", callback_data=f"review_{msg_id}")]
-                    ])
-                    
                     for admin in ADMINS:
+                        if admin == SUPER_ADMIN:
+                            text = (
+                                f"⚠️ <b>Долгое сообщение #{msg_id}</b>\n\n"
+                                f"Висит в очереди больше {LONG_MESSAGE_THRESHOLD} минут!\n"
+                                f"Тип: {media_type or 'текст'}\n"
+                                f"Время отправки: {created_at[:16]}\n"
+                                f"Текст: {short_text}\n"
+                                f"От пользователя: <code>{user_id}</code>"
+                            )
+                        else:
+                            text = (
+                                f"⚠️ <b>Долгое сообщение #{msg_id}</b>\n\n"
+                                f"Висит в очереди больше {LONG_MESSAGE_THRESHOLD} минут!\n"
+                                f"Тип: {media_type or 'текст'}\n"
+                                f"Время отправки: {created_at[:16]}\n"
+                                f"Текст: {short_text}"
+                            )
+                        
+                        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔍 Перейти к рассмотрению", callback_data=f"review_{msg_id}")]
+                        ])
+                        
                         try:
                             await bot.send_message(admin, text, reply_markup=keyboard)
                         except:
@@ -906,8 +934,17 @@ async def heartbeat():
         try:
             cache_size = len(user_cache)
             mode, interval = get_current_mode_and_interval()
-            mode_text = "🌙 Ночной" if mode == 'night' else "☀️ Автоматический" if mode == 'auto' else "👨‍💻 Ручной"
-            logger.info(f"❤️ Heartbeat - Бот работает | Режим: {mode_text} ({interval} мин) | Пользователей в кэше: {cache_size}")
+            
+            if mode == 'night':
+                mode_text = f"🌙 Ночной {'✅' if night_mode_enabled else '❌'}"
+            elif mode == 'night_disabled':
+                mode_text = f"🌙 Ночной ❌ (выключен)"
+            elif mode == 'auto':
+                mode_text = f"☀️ Автоматический {'✅' if auto_mode_enabled else '❌'}"
+            else:
+                mode_text = f"☀️ Автоматический ❌ (выключен)"
+            
+            logger.info(f"❤️ Heartbeat - Бот работает | Режим: {mode_text} (интервал {interval} мин) | Пользователей в кэше: {cache_size}")
             await bot.get_me()
         except Exception as e:
             logger.error(f"Heartbeat error: {e}")
@@ -920,7 +957,7 @@ async def heartbeat():
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
-    global night_mode_enabled, maintenance_mode
+    global night_mode_enabled, auto_mode_enabled, maintenance_mode
     
     try:
         async with db_pool.acquire() as db:
@@ -958,8 +995,11 @@ async def start(message: Message, state: FSMContext):
         
         if message.from_user.id == SUPER_ADMIN:
             night_status = "✅ Включен" if night_mode_enabled else "❌ Выключен"
+            auto_status = "✅ Включен" if auto_mode_enabled else "❌ Выключен"
             maint_status = "🔧 Включены" if maintenance_mode else "🔧 Выключены"
+            
             keyboard_buttons.append([KeyboardButton(text=f"🌙 Ночной режим ({night_status})")])
+            keyboard_buttons.append([KeyboardButton(text=f"☀️ Авто-режим ({auto_status})")])
             keyboard_buttons.append([KeyboardButton(text=f"🛠 Техработы ({maint_status})")])
             keyboard_buttons.append([KeyboardButton(text="👥 Управление исключениями")])
             keyboard_buttons.append([KeyboardButton(text="📝 Черный список слов")])
@@ -1234,7 +1274,14 @@ async def admin_stats(message: Message):
         return
     
     mode, interval = get_current_mode_and_interval()
-    mode_text = "🌙 Ночной" if mode == 'night' else "☀️ Автоматический" if mode == 'auto' else "👨‍💻 Ручной"
+    if mode == 'night':
+        mode_text = f"🌙 Ночной {'✅' if night_mode_enabled else '❌'}"
+    elif mode == 'night_disabled':
+        mode_text = "🌙 Ночной ❌ (выключен)"
+    elif mode == 'auto':
+        mode_text = f"☀️ Автоматический {'✅' if auto_mode_enabled else '❌'}"
+    else:
+        mode_text = "☀️ Автоматический ❌ (выключен)"
     
     stats_text = (
         f"📊 <b>Статистика</b>\n\n"
@@ -1255,6 +1302,7 @@ async def admin_stats(message: Message):
         f"📋 Действий сегодня: {today_actions}\n"
         f"📩 Новых личных сообщений: {new_messages}\n"
         f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}\n"
+        f"☀️ Авто-режим: {'✅' if auto_mode_enabled else '❌'}\n"
         f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}\n"
         f"⏱ Текущий режим: {mode_text} (интервал {interval} мин)"
     )
@@ -1376,6 +1424,74 @@ async def close_menu(message: Message, state: FSMContext):
         "Меню закрыто. Чтобы открыть снова, напишите /start",
         reply_markup=ReplyKeyboardRemove()
     )
+
+# ================= ПЕРЕКЛЮЧАТЕЛИ РЕЖИМОВ =================
+
+@dp.message(F.text.startswith("🌙 Ночной режим"))
+async def toggle_night_mode(message: Message):
+    if message.from_user.id != SUPER_ADMIN:
+        return
+    
+    global night_mode_enabled
+    night_mode_enabled = not night_mode_enabled
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE settings SET value=? WHERE key='night_mode'",
+                (str(int(night_mode_enabled)),)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"DB error in toggle_night_mode: {e}")
+    
+    status = "включен" if night_mode_enabled else "выключен"
+    await message.answer(f"🌙 Ночной режим {status} (00:00-08:00, интервал 30 мин)")
+    await log_admin_action(message.from_user.id, "night_mode_toggle", details=status)
+
+@dp.message(F.text.startswith("☀️ Авто-режим"))
+async def toggle_auto_mode(message: Message):
+    if message.from_user.id != SUPER_ADMIN:
+        return
+    
+    global auto_mode_enabled
+    auto_mode_enabled = not auto_mode_enabled
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE settings SET value=? WHERE key='auto_mode'",
+                (str(int(auto_mode_enabled)),)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"DB error in toggle_auto_mode: {e}")
+    
+    status = "включен" if auto_mode_enabled else "выключен"
+    await message.answer(f"☀️ Автоматический режим {status} (08:01-23:59, интервал 5 мин)")
+    await log_admin_action(message.from_user.id, "auto_mode_toggle", details=status)
+
+@dp.message(F.text.startswith("🛠 Техработы"))
+async def toggle_maintenance(message: Message):
+    if message.from_user.id != SUPER_ADMIN:
+        return
+    
+    global maintenance_mode
+    maintenance_mode = not maintenance_mode
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE settings SET value=? WHERE key='maintenance'",
+                (str(int(maintenance_mode)),)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"DB error in toggle_maintenance: {e}")
+    
+    status = "включены" if maintenance_mode else "выключены"
+    await message.answer(f"🛠 Технические работы {status}")
+    await log_admin_action(message.from_user.id, "maintenance_toggle", details=status)
 
 # ================= УПРАВЛЕНИЕ ЧЕРНЫМ СПИСКОМ =================
 
@@ -1678,7 +1794,8 @@ async def show_admin_history(message: Message):
             "unban": "✅", "unmute": "🔊", "skip": "⏭",
             "blacklist_add": "📝➕", "blacklist_remove": "📝➖",
             "temporary_mute": "⏳", "reply": "💬",
-            "approve_watermark": "✅➕"
+            "approve_watermark": "✅➕",
+            "night_mode_toggle": "🌙", "auto_mode_toggle": "☀️"
         }.get(action, "📌")
         
         target_text = f" <code>{target_id}</code>" if target_id else ""
@@ -1738,54 +1855,6 @@ async def export_history(callback: CallbackQuery):
     )
     
     await callback.answer()
-
-# ================= ТЕХРАБОТЫ =================
-
-@dp.message(F.text.startswith("🛠 Техработы"))
-async def toggle_maintenance(message: Message):
-    if message.from_user.id != SUPER_ADMIN:
-        return
-    
-    global maintenance_mode
-    maintenance_mode = not maintenance_mode
-    
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE settings SET value=? WHERE key='maintenance'",
-                (str(int(maintenance_mode)),)
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error(f"DB error in toggle_maintenance: {e}")
-    
-    status = "включены" if maintenance_mode else "выключены"
-    await message.answer(f"🛠 Технические работы {status}")
-    await log_admin_action(message.from_user.id, "maintenance_toggle", details=status)
-
-# ================= НОЧНОЙ РЕЖИМ (TOGGLE) =================
-
-@dp.message(F.text.startswith("🌙 Ночной режим"))
-async def toggle_night_mode(message: Message):
-    if message.from_user.id != SUPER_ADMIN:
-        return
-    
-    global night_mode_enabled
-    night_mode_enabled = not night_mode_enabled
-    
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE settings SET value=? WHERE key='night_mode'",
-                (str(int(night_mode_enabled)),)
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error(f"DB error in toggle_night_mode: {e}")
-    
-    status = "включен" if night_mode_enabled else "выключен"
-    await message.answer(f"🌙 Ночной режим {status}")
-    await log_admin_action(message.from_user.id, "night_mode_toggle", details=status)
 
 # ================= ПОИСК ПОЛЬЗОВАТЕЛЯ =================
 
@@ -2277,9 +2346,9 @@ async def handle_user_media(message: Message, state: FSMContext):
             except Exception as e:
                 logger.error(f"Error sending to admin: {e}")
 
-# ================= ОТВЕТЫ НА СООБЩЕНИЯ (НОВАЯ СИСТЕМА) =================
+# ================= ОТВЕТЫ НА СООБЩЕНИЯ =================
 
-# Словарь для временного хранения ответов (НЕ FSM!)
+# Словарь для временного хранения ответов
 reply_storage = {}  # {admin_id: {"user_id": int, "msg_id": int, "type": str}}
 
 @dp.callback_query(F.data.startswith("reply_"))
@@ -2350,7 +2419,7 @@ async def handle_reply_input(message: Message):
     if message.text == "/cancel":
         del reply_storage[message.from_user.id]
         await message.answer("❌ Ответ отменён")
-        return  # Завершаем обработку
+        return
     
     # Получаем данные
     data = reply_storage[message.from_user.id]
@@ -2386,8 +2455,6 @@ async def handle_reply_input(message: Message):
     
     # Удаляем из хранилища
     del reply_storage[message.from_user.id]
-    # НЕ ВОЗВРАЩАЕМ! Сообщение должно идти дальше к другим обработчикам
-    return
 
 # ================= ПРОСМОТР СООБЩЕНИЯ =================
 
@@ -2581,7 +2648,7 @@ async def approve_with_watermark(callback: CallbackQuery):
         header = f"📌 <b>Анонимное сообщение</b>\n\n"
         footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
 
-    # Публикуем ТОЛЬКО ОДИН РАЗ - фото с водяным знаком
+    # Публикуем фото с водяным знаком
     await bot.send_photo(
         CHANNEL_ID,
         photo=new_file_id,
@@ -2589,10 +2656,28 @@ async def approve_with_watermark(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
 
-    # Отвечаем админу, что всё ок
+    # Проверяем тип сообщения для редактирования
     center_status = " + фото-вставка" if os.path.exists("watermark_center.png") else ""
-    await callback.message.edit_text(f"✅ Фото #{msg_id} опубликовано с водяным знаком (@podslu10{center_status})")
-    await callback.answer()
+    
+    try:
+        # Пытаемся отредактировать сообщение с кнопками
+        if callback.message.photo or callback.message.video:
+            await callback.message.edit_caption(
+                caption=callback.message.caption.replace("\n\n🔄 <b>Рассматривается...</b>", "") + f"\n\n✅ <b>ОПУБЛИКОВАНО С ВОДЯНЫМ ЗНАКОМ{center_status}</b>",
+                reply_markup=None
+            )
+        else:
+            await callback.message.edit_text(
+                text=callback.message.text.replace("\n\n🔄 <b>Рассматривается...</b>", "") + f"\n\n✅ <b>ОПУБЛИКОВАНО С ВОДЯНЫМ ЗНАКОМ{center_status}</b>",
+                reply_markup=None
+            )
+    except:
+        # Если не получилось отредактировать, просто удаляем старое сообщение и шлём новое
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        await callback.message.answer(f"✅ Фото #{msg_id} опубликовано с водяным знаком{center_status}")
 
     # Уведомляем пользователя
     try:
@@ -3431,7 +3516,6 @@ async def run_http_server():
                 users_count = 0
             
             mode, interval = get_current_mode_and_interval()
-            mode_text = "night" if mode == 'night' else "auto" if mode == 'auto' else "manual"
             
             return web.json_response({
                 "status": "ok",
@@ -3442,8 +3526,9 @@ async def run_http_server():
                 "pending_in_db": pending_count,
                 "total_users": users_count,
                 "night_mode_enabled": night_mode_enabled,
+                "auto_mode_enabled": auto_mode_enabled,
                 "maintenance": maintenance_mode,
-                "current_mode": mode_text,
+                "current_mode": mode,
                 "auto_interval_minutes": interval,
                 "blacklist_size": len(blacklist_cache),
                 "timestamp": datetime.utcnow().isoformat()
@@ -3471,7 +3556,7 @@ async def run_http_server():
         logger.error(f"Failed to start HTTP server: {e}")
 
 async def main():
-    global night_mode_enabled, maintenance_mode, shutdown_flag
+    global night_mode_enabled, auto_mode_enabled, maintenance_mode, shutdown_flag
     
     logger.info("=" * 50)
     logger.info("BOT STARTING ON RAILWAY...")
@@ -3485,6 +3570,11 @@ async def main():
             if result:
                 night_mode_enabled = bool(int(result[0]))
             
+            cursor = await db.execute("SELECT value FROM settings WHERE key='auto_mode'")
+            result = await cursor.fetchone()
+            if result:
+                auto_mode_enabled = bool(int(result[0]))
+            
             cursor = await db.execute("SELECT value FROM settings WHERE key='maintenance'")
             result = await cursor.fetchone()
             if result:
@@ -3496,15 +3586,15 @@ async def main():
     asyncio.create_task(check_long_pending_messages())
     asyncio.create_task(heartbeat())
     
-    # ====== ЗАПУСКАЕМ HTTP-СЕРВЕР ДЛЯ RENDER ======
+    # Запускаем HTTP-сервер
     asyncio.create_task(run_http_server())
-    # ==============================================
     
     logger.info("=" * 50)
     logger.info(f"🤖 Бот запущен на Railway!")
     logger.info(f"👑 SUPER_ADMIN: {SUPER_ADMIN}")
     logger.info(f"👥 ADMINS: {ADMINS}")
     logger.info(f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}")
+    logger.info(f"☀️ Авто-режим: {'✅' if auto_mode_enabled else '❌'}")
     logger.info(f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}")
     logger.info(f"📚 Черный список: {len(blacklist_cache)} слов")
     
