@@ -47,7 +47,10 @@ logger = logging.getLogger(__name__)
 
 NIGHT_MODE_START = 0
 NIGHT_MODE_END = 8
-NIGHT_POST_INTERVAL = 30
+AUTO_MODE_START = 8
+AUTO_MODE_END = 0
+NIGHT_POST_INTERVAL = 30  # 30 минут ночью
+AUTO_POST_INTERVAL = 5     # 5 минут днём
 INSULT_THRESHOLD = 4
 LONG_MESSAGE_THRESHOLD = 60
 
@@ -67,7 +70,7 @@ user_message_cooldown = TTLCache(maxsize=1000, ttl=1800)
 # Флаги
 night_mode_enabled = False
 maintenance_mode = False
-maintenance_exceptions = set()  # Только ОДНО определение!
+maintenance_exceptions = set()
 shutdown_flag = False
 start_time = time.time()
 
@@ -406,39 +409,59 @@ def has_immoral_content(text: str) -> bool:
             return True
     return False
 
-def is_night_time() -> bool:
+def get_current_mode_and_interval():
+    """
+    Определяет текущий режим работы и интервал публикации
+    Возвращает: (режим, интервал в минутах)
+    режим: 'night' (ночной), 'auto' (автоматический дневной), 'manual' (ручной)
+    """
     now_utc = datetime.utcnow()
     now_msk = now_utc + timedelta(hours=3)
     hour = now_msk.hour
-    if NIGHT_MODE_START <= NIGHT_MODE_END:
-        return NIGHT_MODE_START <= hour < NIGHT_MODE_END
-    return hour >= NIGHT_MODE_START or hour < NIGHT_MODE_END
+    
+    # Ночной режим: 00:00 - 08:00
+    if hour < 8:
+        return 'night', NIGHT_POST_INTERVAL
+    # Автоматический режим: 08:01 - 23:59
+    else:
+        return 'auto', AUTO_POST_INTERVAL
 
-# ================= ВОДЯНОЙ ЗНАК (15 ЗНАКОВ - 3 КОЛОНКИ ПО 5) =================
+def is_night_time() -> bool:
+    """Только для ночного режима (00:00 - 08:00)"""
+    mode, _ = get_current_mode_and_interval()
+    return mode == 'night'
+
+def is_auto_time() -> bool:
+    """Проверка на автоматический режим (08:01 - 23:59)"""
+    mode, _ = get_current_mode_and_interval()
+    return mode == 'auto'
+
+# ================= ВОДЯНОЙ ЗНАК (15 ТЕКСТОВЫХ + ЦЕНТРАЛЬНОЕ ФОТО) =================
 
 async def add_watermark_to_photo(photo_file_id: str) -> str:
     """
-    Накладывает мелкие полупрозрачные водяные знаки @podslu10
-    3 колонки по 5 знаков (слева, центр, справа)
+    Накладывает:
+    - 15 мелких полупрозрачных текстовых знаков @podslu10 (3 колонки по 5)
+    - Почти прозрачное фото по центру (watermark_center.png)
     """
     try:
-        # Скачиваем фото
+        # Скачиваем фото пользователя
         file = await bot.get_file(photo_file_id)
         photo_bytes = await bot.download_file(file.file_path)
 
-        # Открываем изображение
+        # Открываем изображение пользователя
         img = Image.open(photo_bytes).convert("RGBA")
         width, height = img.size
 
-        # Создаём слой для водяного знака
-        txt = Image.new("RGBA", img.size, (255, 255, 255, 0))
-        draw = ImageDraw.Draw(txt)
+        # ===== 1. ТЕКСТОВЫЕ ВОДЯНЫЕ ЗНАКИ (15 штук) =====
+        txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt_layer)
 
         # Текст водяного знака
         text = "@podslu10"
         
-        # МЕЛКИЙ ШРИФТ - 4% от ширины
-        font_size = max(16, int(width * 0.04))
+        # МЕЛКИЙ ШРИФТ - 3% от ширины (еще мельче)
+        font_size = max(12, int(width * 0.03))
         
         # Пробуем использовать разные шрифты
         font = None
@@ -458,39 +481,30 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
-        # ПОЛУПРОЗРАЧНЫЙ ЧЕРНЫЙ (50% прозрачности)
-        fill_color = (0, 0, 0, 128)
+        # ОЧЕНЬ ПРОЗРАЧНЫЙ ЧЕРНЫЙ (15% прозрачности - едва заметный)
+        fill_color = (0, 0, 0, 38)  # 15% opacity (255 * 0.15 = 38)
 
         # ПОЗИЦИИ ПО ГОРИЗОНТАЛИ - три колонки
         positions_x = [
-            int(width * 0.15),  # слева (15% от края)
+            int(width * 0.12),  # слева
             int(width * 0.5),   # центр
-            int(width * 0.85)   # справа (85% от края)
+            int(width * 0.88)   # справа
         ]
 
         # ПОЗИЦИИ ПО ВЕРТИКАЛИ - 5 знаков
         positions_y = []
         for i in range(5):
-            # Равномерно распределяем по высоте с отступами от краев
             y = int(height * (0.1 + i * 0.2))  # 10%, 30%, 50%, 70%, 90%
             positions_y.append(y)
 
         # Заполняем все колонки
         for col, x in enumerate(positions_x):
-            # Корректируем X для каждой колонки
-            if col == 0:  # левая колонка
-                x_final = int(width * 0.12)
-            elif col == 1:  # центр
-                x_final = int(width * 0.5)
-            else:  # правая колонка
-                x_final = int(width * 0.88)
-            
             for row, y in enumerate(positions_y):
                 # Небольшое случайное смещение для каждой пары колонка/ряд
                 offset_x = int(text_width * 0.2) * (hash(f"{col}{row}") % 3 - 1)
                 offset_y = int(text_height * 0.2) * (hash(f"{col}{row}") % 3 - 1)
                 
-                final_x = x_final + offset_x
+                final_x = x + offset_x
                 final_y = y + offset_y
                 
                 # Центрируем текст (чтобы центр текста был в нужной точке)
@@ -504,8 +518,52 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
                     fill=fill_color
                 )
 
-        # Объединяем
-        watermarked = Image.alpha_composite(img, txt).convert("RGB")
+        # ===== 2. ЦЕНТРАЛЬНОЕ ФОТО-ВСТАВКА =====
+        # Пытаемся загрузить центральный водяной знак
+        center_watermark_path = "watermark_center.png"
+        
+        if os.path.exists(center_watermark_path):
+            try:
+                # Открываем центральный водяной знак
+                center_img = Image.open(center_watermark_path).convert("RGBA")
+                
+                # Рассчитываем размер для центрального знака (30% от ширины фото)
+                center_size = int(width * 0.3)
+                center_img = center_img.resize((center_size, center_size), Image.Resampling.LANCZOS)
+                
+                # Делаем центральный знак ПОЧТИ ПРОЗРАЧНЫМ (5-8% прозрачности)
+                center_array = center_img.getdata()
+                new_center_array = []
+                for item in center_array:
+                    # Если пиксель не полностью прозрачный, делаем его очень прозрачным
+                    if item[3] > 0:
+                        # Устанавливаем прозрачность 5-8% (13-20 из 255)
+                        new_center_array.append((item[0], item[1], item[2], 15))
+                    else:
+                        new_center_array.append(item)
+                
+                center_img.putdata(new_center_array)
+                
+                # Позиция для центрального знака (по центру фото)
+                center_x = (width - center_size) // 2
+                center_y = (height - center_size) // 2
+                
+                # Создаем слой для центрального знака
+                center_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+                center_layer.paste(center_img, (center_x, center_y), center_img)
+                
+                # Объединяем текстовый слой и центральный слой
+                combined_layer = Image.alpha_composite(txt_layer, center_layer)
+                
+            except Exception as e:
+                logger.error(f"Error adding center watermark: {e}")
+                combined_layer = txt_layer
+        else:
+            logger.warning(f"Center watermark file {center_watermark_path} not found. Using only text watermarks.")
+            combined_layer = txt_layer
+
+        # Объединяем оригинал со всеми водяными знаками
+        watermarked = Image.alpha_composite(img, combined_layer).convert("RGB")
 
         # Сохраняем во временный файл
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
@@ -521,7 +579,8 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         new_file_id = msg.photo[-1].file_id
         os.unlink(temp_path)
         
-        logger.info(f"Watermark pattern added - 3 columns x 5 rows = 15 marks, size: {font_size}px")
+        center_status = "with center photo" if os.path.exists(center_watermark_path) else "without center photo"
+        logger.info(f"Watermark added - 15 text marks + {center_status}, size: {font_size}px")
         return new_file_id
 
     except Exception as e:
@@ -670,21 +729,31 @@ async def init_db():
     
     await load_blacklist_to_cache()
 
-# ================= НОЧНОЙ РЕЖИМ =================
+# ================= АВТОМАТИЧЕСКАЯ ПУБЛИКАЦИЯ =================
 
-async def notify_admins_about_auto_post(msg_id: int, user_id: int, media_type: str, counter: int):
+async def notify_admins_about_auto_post(msg_id: int, user_id: int, media_type: str, counter: int, mode: str):
     if shutdown_flag:
         return
+    
+    mode_text = "🌙 Ночной режим" if mode == 'night' else "☀️ Автоматический режим"
+    interval_text = "30 мин" if mode == 'night' else "5 мин"
+    
     text = (
         f"🤖 <b>Автоматическая публикация</b>\n\n"
-        f"Сообщение #{msg_id} от пользователя <code>{user_id}</code>\n"
-        f"Тип: {media_type}\n"
+        f"{mode_text}\n"
+        f"Интервал: {interval_text}\n"
+        f"Сообщение #{msg_id}\n"
         f"Номер поста: #{counter}\n"
-        f"Опубликовано в ночном режиме"
+        f"Тип: {media_type}"
     )
+    
+    # Для обычных админов НЕ показываем ID пользователя
     for admin in ADMINS:
         try:
-            await bot.send_message(admin, text)
+            if admin == SUPER_ADMIN:
+                await bot.send_message(admin, text + f"\nОт пользователя: <code>{user_id}</code>")
+            else:
+                await bot.send_message(admin, text)
             await asyncio.sleep(0.1)
         except:
             pass
@@ -749,7 +818,8 @@ async def post_next_message():
             disable_web_page_preview=True
         )
         
-        await notify_admins_about_auto_post(msg_id, user_id, "текст", counter)
+        mode, _ = get_current_mode_and_interval()
+        await notify_admins_about_auto_post(msg_id, user_id, "текст", counter, mode)
         
     except Exception as e:
         logger.error(f"Ошибка авто-публикации: {e}")
@@ -758,14 +828,16 @@ async def auto_post_messages():
     global night_mode_enabled, shutdown_flag
     while not shutdown_flag:
         try:
-            if night_mode_enabled and is_night_time() and not maintenance_mode:
-                await post_next_message()
-            for _ in range(NIGHT_POST_INTERVAL * 60):
+            if night_mode_enabled and not maintenance_mode:
+                mode, interval = get_current_mode_and_interval()
+                if mode in ['night', 'auto']:  # Работаем в обоих режимах
+                    await post_next_message()
+            for _ in range(60):  # Проверяем каждую минуту
                 if shutdown_flag:
                     break
                 await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Ошибка в ночном режиме: {e}")
+            logger.error(f"Ошибка в автоматическом режиме: {e}")
             await asyncio.sleep(5)
 
 # ================= ПРОВЕРКА ДОЛГИХ СООБЩЕНИЙ =================
@@ -793,11 +865,14 @@ async def check_long_pending_messages():
                     text = (
                         f"⚠️ <b>Долгое сообщение #{msg_id}</b>\n\n"
                         f"Висит в очереди больше {LONG_MESSAGE_THRESHOLD} минут!\n"
-                        f"От пользователя: <code>{user_id}</code>\n"
                         f"Тип: {media_type or 'текст'}\n"
                         f"Время отправки: {created_at[:16]}\n"
                         f"Текст: {short_text}"
                     )
+                    
+                    # Для SUPER_ADMIN показываем ID
+                    if admin == SUPER_ADMIN:
+                        text += f"\nОт пользователя: <code>{user_id}</code>"
                     
                     keyboard = InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="🔍 Перейти к рассмотрению", callback_data=f"review_{msg_id}")]
@@ -830,7 +905,9 @@ async def heartbeat():
     while not shutdown_flag:
         try:
             cache_size = len(user_cache)
-            logger.info(f"❤️ Heartbeat - Бот работает | Пользователей в кэше: {cache_size}")
+            mode, interval = get_current_mode_and_interval()
+            mode_text = "🌙 Ночной" if mode == 'night' else "☀️ Автоматический" if mode == 'auto' else "👨‍💻 Ручной"
+            logger.info(f"❤️ Heartbeat - Бот работает | Режим: {mode_text} ({interval} мин) | Пользователей в кэше: {cache_size}")
             await bot.get_me()
         except Exception as e:
             logger.error(f"Heartbeat error: {e}")
@@ -904,7 +981,7 @@ async def start(message: Message, state: FSMContext):
         keyboard=[
             [KeyboardButton(text="ℹ Информация")],
             [KeyboardButton(text="❓ Помощь")],
-            [KeyboardButton(text="📩 Написать админу")]
+            # [KeyboardButton(text="📩 Написать админу")]  # Функция отключена до починки
         ],
         resize_keyboard=True,
         input_field_placeholder="Отправьте сообщение, фото или видео..."
@@ -913,7 +990,8 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "👋 <b>Подслушано</b>\n\n"
         "Отправьте сообщение, фото или видео - они будут опубликованы анонимно после проверки.\n"
-        "В ночное время (с 0 до 8 утра) текстовые сообщения без ссылок публикуются автоматически.",
+        "В автоматическом режиме (с 8:01 до 23:59) текстовые сообщения публикуются раз в 5 минут.\n"
+        "В ночное время (с 0 до 8 утра) - раз в 30 минут.",
         reply_markup=keyboard
     )
 
@@ -928,7 +1006,9 @@ async def info_text(message: Message):
         "• Текстовые сообщения\n"
         "• Фотографии\n"
         "• Видео\n\n"
-        "В ночное время (с 0 до 8 утра) текстовые сообщения без ссылок публикуются автоматически.\n"
+        "Режимы автоматической публикации:\n"
+        "🌙 Ночной (00:00 - 08:00): текстовые сообщения без ссылок публикуются раз в 30 минут\n"
+        "☀️ Автоматический (08:01 - 23:59): текстовые сообщения без ссылок публикуются раз в 5 минут\n\n"
         "Фото и видео всегда проверяются модераторами."
     )
 
@@ -946,142 +1026,142 @@ async def help_text(message: Message):
         "Фото и видео всегда проходят ручную проверку."
     )
 
-# ================= ЛИЧНОЕ СООБЩЕНИЕ АДМИНУ =================
+# ================= ФУНКЦИЯ "НАПИСАТЬ АДМИНУ" (ЗАКОММЕНТИРОВАНА) =================
 
-@dp.message(F.text == "📩 Написать админу")
-async def ask_admin(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if user_id in user_message_cooldown:
-        remaining = user_message_cooldown[user_id]
-        minutes = remaining // 60
-        seconds = remaining % 60
-        await message.answer(f"⏳ Вы уже отправляли сообщение. Подождите {minutes} мин {seconds} сек.")
-        return
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-    await state.set_state(AdminStates.waiting_for_admin_message)
-    await message.answer(ADMIN_MESSAGE_INFO, reply_markup=keyboard)
-
-@dp.message(AdminStates.waiting_for_admin_message)
-async def send_to_admin(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if message.text == "❌ Отмена":
-        await state.clear()
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="ℹ Информация")],
-                [KeyboardButton(text="❓ Помощь")],
-                [KeyboardButton(text="📩 Написать админу")]
-            ],
-            resize_keyboard=True
-        )
-        await message.answer("❌ Отправка отменена", reply_markup=keyboard)
-        return
-
-    text = message.text
-    if not text:
-        await message.answer("❌ Напишите текст сообщения")
-        return
-
-    async with db_pool.acquire() as db:
-        await db.execute(
-            "INSERT INTO admin_messages (user_id, message, created_at) VALUES (?, ?, ?)",
-            (user_id, text, datetime.utcnow().isoformat())
-        )
-        await db.commit()
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Рассмотрено", callback_data=f"adminmsg_done_{user_id}"),
-            InlineKeyboardButton(text="🔇 Мут", callback_data=f"adminmsg_mute_{user_id}")
-        ],
-        [
-            InlineKeyboardButton(text="💬 Ответить", callback_data=f"adminmsg_reply_{user_id}")
-        ]
-    ])
-
-    await bot.send_message(
-        SUPER_ADMIN,
-        f"📩 <b>Личное сообщение</b>\n\n"
-        f"👤 ID: <code>{user_id}</code>\n"
-        f"📛 Username: @{message.from_user.username or 'нет'}\n"
-        f"📝 Имя: {message.from_user.first_name or 'нет'}\n\n"
-        f"💬 <b>Сообщение:</b>\n{text}",
-        reply_markup=keyboard
-    )
-
-    user_message_cooldown[user_id] = 1800
-
-    keyboard_normal = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="ℹ Информация")],
-            [KeyboardButton(text="❓ Помощь")],
-            [KeyboardButton(text="📩 Написать админу")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("✅ Сообщение отправлено администрации. Ожидайте ответа.", reply_markup=keyboard_normal)
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("adminmsg_done_"))
-async def admin_message_done(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    user_id = int(callback.data.split("_")[2])
-    
-    async with db_pool.acquire() as db:
-        await db.execute(
-            "UPDATE admin_messages SET status='reviewed' WHERE user_id=? AND status='new'",
-            (user_id,)
-        )
-        await db.commit()
-    
-    await callback.message.edit_text(
-        callback.message.text + "\n\n✅ <b>Рассмотрено</b>",
-        reply_markup=None
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("adminmsg_mute_"))
-async def admin_message_mute(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    user_id = int(callback.data.split("_")[2])
-
-    await state.update_data(mute_user_id=user_id)
-    await state.set_state(AdminStates.waiting_for_mute_duration)
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="1 час", callback_data="mute_1h"),
-            InlineKeyboardButton(text="3 часа", callback_data="mute_3h"),
-            InlineKeyboardButton(text="6 часов", callback_data="mute_6h")
-        ],
-        [
-            InlineKeyboardButton(text="12 часов", callback_data="mute_12h"),
-            InlineKeyboardButton(text="1 день", callback_data="mute_1d"),
-            InlineKeyboardButton(text="3 дня", callback_data="mute_3d")
-        ],
-        [
-            InlineKeyboardButton(text="7 дней", callback_data="mute_7d"),
-            InlineKeyboardButton(text="30 дней", callback_data="mute_30d"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="mute_cancel")
-        ]
-    ])
-
-    await callback.message.answer(
-        f"⏳ Выберите длительность мута для пользователя {user_id}:",
-        reply_markup=keyboard
-    )
-    await callback.answer()
+# @dp.message(F.text == "📩 Написать админу")
+# async def ask_admin(message: Message, state: FSMContext):
+#     user_id = message.from_user.id
+# 
+#     if user_id in user_message_cooldown:
+#         remaining = user_message_cooldown[user_id]
+#         minutes = remaining // 60
+#         seconds = remaining % 60
+#         await message.answer(f"⏳ Вы уже отправляли сообщение. Подождите {minutes} мин {seconds} сек.")
+#         return
+# 
+#     keyboard = ReplyKeyboardMarkup(
+#         keyboard=[[KeyboardButton(text="❌ Отмена")]],
+#         resize_keyboard=True,
+#         one_time_keyboard=True
+#     )
+# 
+#     await state.set_state(AdminStates.waiting_for_admin_message)
+#     await message.answer(ADMIN_MESSAGE_INFO, reply_markup=keyboard)
+# 
+# @dp.message(AdminStates.waiting_for_admin_message)
+# async def send_to_admin(message: Message, state: FSMContext):
+#     user_id = message.from_user.id
+# 
+#     if message.text == "❌ Отмена":
+#         await state.clear()
+#         keyboard = ReplyKeyboardMarkup(
+#             keyboard=[
+#                 [KeyboardButton(text="ℹ Информация")],
+#                 [KeyboardButton(text="❓ Помощь")],
+#                 [KeyboardButton(text="📩 Написать админу")]
+#             ],
+#             resize_keyboard=True
+#         )
+#         await message.answer("❌ Отправка отменена", reply_markup=keyboard)
+#         return
+# 
+#     text = message.text
+#     if not text:
+#         await message.answer("❌ Напишите текст сообщения")
+#         return
+# 
+#     async with db_pool.acquire() as db:
+#         await db.execute(
+#             "INSERT INTO admin_messages (user_id, message, created_at) VALUES (?, ?, ?)",
+#             (user_id, text, datetime.utcnow().isoformat())
+#         )
+#         await db.commit()
+# 
+#     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+#         [
+#             InlineKeyboardButton(text="✅ Рассмотрено", callback_data=f"adminmsg_done_{user_id}"),
+#             InlineKeyboardButton(text="🔇 Мут", callback_data=f"adminmsg_mute_{user_id}")
+#         ],
+#         [
+#             InlineKeyboardButton(text="💬 Ответить", callback_data=f"adminmsg_reply_{user_id}")
+#         ]
+#     ])
+# 
+#     await bot.send_message(
+#         SUPER_ADMIN,
+#         f"📩 <b>Личное сообщение</b>\n\n"
+#         f"👤 ID: <code>{user_id}</code>\n"
+#         f"📛 Username: @{message.from_user.username or 'нет'}\n"
+#         f"📝 Имя: {message.from_user.first_name or 'нет'}\n\n"
+#         f"💬 <b>Сообщение:</b>\n{text}",
+#         reply_markup=keyboard
+#     )
+# 
+#     user_message_cooldown[user_id] = 1800
+# 
+#     keyboard_normal = ReplyKeyboardMarkup(
+#         keyboard=[
+#             [KeyboardButton(text="ℹ Информация")],
+#             [KeyboardButton(text="❓ Помощь")],
+#             [KeyboardButton(text="📩 Написать админу")]
+#         ],
+#         resize_keyboard=True
+#     )
+# 
+#     await message.answer("✅ Сообщение отправлено администрации. Ожидайте ответа.", reply_markup=keyboard_normal)
+#     await state.clear()
+# 
+# @dp.callback_query(F.data.startswith("adminmsg_done_"))
+# async def admin_message_done(callback: CallbackQuery):
+#     if callback.from_user.id != SUPER_ADMIN:
+#         return
+#     user_id = int(callback.data.split("_")[2])
+#     
+#     async with db_pool.acquire() as db:
+#         await db.execute(
+#             "UPDATE admin_messages SET status='reviewed' WHERE user_id=? AND status='new'",
+#             (user_id,)
+#         )
+#         await db.commit()
+#     
+#     await callback.message.edit_text(
+#         callback.message.text + "\n\n✅ <b>Рассмотрено</b>",
+#         reply_markup=None
+#     )
+#     await callback.answer()
+# 
+# @dp.callback_query(F.data.startswith("adminmsg_mute_"))
+# async def admin_message_mute(callback: CallbackQuery, state: FSMContext):
+#     if callback.from_user.id != SUPER_ADMIN:
+#         return
+#     user_id = int(callback.data.split("_")[2])
+# 
+#     await state.update_data(mute_user_id=user_id)
+#     await state.set_state(AdminStates.waiting_for_mute_duration)
+# 
+#     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+#         [
+#             InlineKeyboardButton(text="1 час", callback_data="mute_1h"),
+#             InlineKeyboardButton(text="3 часа", callback_data="mute_3h"),
+#             InlineKeyboardButton(text="6 часов", callback_data="mute_6h")
+#         ],
+#         [
+#             InlineKeyboardButton(text="12 часов", callback_data="mute_12h"),
+#             InlineKeyboardButton(text="1 день", callback_data="mute_1d"),
+#             InlineKeyboardButton(text="3 дня", callback_data="mute_3d")
+#         ],
+#         [
+#             InlineKeyboardButton(text="7 дней", callback_data="mute_7d"),
+#             InlineKeyboardButton(text="30 дней", callback_data="mute_30d"),
+#             InlineKeyboardButton(text="❌ Отмена", callback_data="mute_cancel")
+#         ]
+#     ])
+# 
+#     await callback.message.answer(
+#         f"⏳ Выберите длительность мута для пользователя {user_id}:",
+#         reply_markup=keyboard
+#     )
+#     await callback.answer()
 
 # ================= АДМИНСКИЕ КНОПКИ =================
 
@@ -1153,6 +1233,9 @@ async def admin_stats(message: Message):
         await message.answer("❌ Ошибка получения статистики")
         return
     
+    mode, interval = get_current_mode_and_interval()
+    mode_text = "🌙 Ночной" if mode == 'night' else "☀️ Автоматический" if mode == 'auto' else "👨‍💻 Ручной"
+    
     stats_text = (
         f"📊 <b>Статистика</b>\n\n"
         f"👥 Всего пользователей: {total_users}\n"
@@ -1172,7 +1255,8 @@ async def admin_stats(message: Message):
         f"📋 Действий сегодня: {today_actions}\n"
         f"📩 Новых личных сообщений: {new_messages}\n"
         f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}\n"
-        f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}"
+        f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}\n"
+        f"⏱ Текущий режим: {mode_text} (интервал {interval} мин)"
     )
     
     await message.answer(stats_text)
@@ -1260,8 +1344,13 @@ async def admin_pending_messages(message: Message):
         if len(display_text) > 30:
             display_text = display_text[:30] + "..."
         
-        text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
-        text += f"👤 ID: {user_id}\n"
+        # Для обычных админов НЕ показываем user_id
+        if message.from_user.id == SUPER_ADMIN:
+            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+            text += f"👤 ID: {user_id}\n"
+        else:
+            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+        
         text += f"💬 {display_text}\n\n"
         
         keyboard.inline_keyboard.append([
@@ -1964,7 +2053,7 @@ async def handle_user_media(message: Message, state: FSMContext):
         ["🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями", 
          "📨 Ожидающие проверки", "❌ Закрыть меню", "ℹ Информация", "❓ Помощь",
          "⏳ Временный мут", "📋 История действий", "📝 Черный список слов",
-         "📩 Написать админу", "❌ Отмена"]):
+         "❌ Отмена"]):
         return
 
     # Проверяем техработы
@@ -2115,35 +2204,68 @@ async def handle_user_media(message: Message, state: FSMContext):
 
     tasks = []
     for admin in ADMINS:
-        if media_type == "photo":
-            tasks.append(
-                bot.send_photo(
-                    admin,
-                    photo=media_file_id,
-                    caption=f"📸 <b>Новое фото</b>{warning_text}\n\n<b>Подпись:</b> {display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.HTML
+        # Для SUPER_ADMIN показываем полную информацию
+        if admin == SUPER_ADMIN:
+            if media_type == "photo":
+                tasks.append(
+                    bot.send_photo(
+                        admin,
+                        photo=media_file_id,
+                        caption=f"📸 <b>Новое фото</b>{warning_text}\n\n<b>Подпись:</b> {display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
                 )
-            )
-        elif media_type == "video":
-            tasks.append(
-                bot.send_video(
-                    admin,
-                    video=media_file_id,
-                    caption=f"🎥 <b>Новое видео</b>{warning_text}\n\n<b>Подпись:</b> {display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.HTML
+            elif media_type == "video":
+                tasks.append(
+                    bot.send_video(
+                        admin,
+                        video=media_file_id,
+                        caption=f"🎥 <b>Новое видео</b>{warning_text}\n\n<b>Подпись:</b> {display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
                 )
-            )
+            else:
+                tasks.append(
+                    bot.send_message(
+                        admin,
+                        f"📨 <b>Новое сообщение</b>{warning_text}\n\n{display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
+                )
+        # Для обычных админов НЕ показываем ID и username
         else:
-            tasks.append(
-                bot.send_message(
-                    admin,
-                    f"📨 <b>Новое сообщение</b>{warning_text}\n\n{display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.HTML
+            if media_type == "photo":
+                tasks.append(
+                    bot.send_photo(
+                        admin,
+                        photo=media_file_id,
+                        caption=f"📸 <b>Новое фото</b>{warning_text}\n\n<b>Подпись:</b> {display_text}",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
                 )
-            )
+            elif media_type == "video":
+                tasks.append(
+                    bot.send_video(
+                        admin,
+                        video=media_file_id,
+                        caption=f"🎥 <b>Новое видео</b>{warning_text}\n\n<b>Подпись:</b> {display_text}",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
+                )
+            else:
+                tasks.append(
+                    bot.send_message(
+                        admin,
+                        f"📨 <b>Новое сообщение</b>{warning_text}\n\n{display_text}",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
+                )
     
     if tasks:
         for task in tasks:
@@ -2468,7 +2590,8 @@ async def approve_with_watermark(callback: CallbackQuery):
     )
 
     # Отвечаем админу, что всё ок
-    await callback.message.edit_text(f"✅ Фото #{msg_id} опубликовано с водяным знаком (@podslu10)")
+    center_status = " + фото-вставка" if os.path.exists("watermark_center.png") else ""
+    await callback.message.edit_text(f"✅ Фото #{msg_id} опубликовано с водяным знаком (@podslu10{center_status})")
     await callback.answer()
 
     # Уведомляем пользователя
@@ -2607,12 +2730,21 @@ async def cancel_review(callback: CallbackQuery):
     for admin in ADMINS:
         if admin != callback.from_user.id:
             try:
-                await bot.send_message(
-                    admin,
-                    f"🔄 <b>Рассмотрение отменено</b>\n\nАдмин {admin_name} отменил рассмотрение сообщения #{msg_id}\n\nСообщение снова доступно для проверки.",
-                    reply_markup=review_keyboard,
-                    parse_mode=ParseMode.HTML
-                )
+                # Для обычных админов не показываем user_id
+                if admin == SUPER_ADMIN:
+                    await bot.send_message(
+                        admin,
+                        f"🔄 <b>Рассмотрение отменено</b>\n\nАдмин {admin_name} отменил рассмотрение сообщения #{msg_id}\n\nСообщение снова доступно для проверки.\nОт пользователя: <code>{user_id}</code>",
+                        reply_markup=review_keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await bot.send_message(
+                        admin,
+                        f"🔄 <b>Рассмотрение отменено</b>\n\nАдмин {admin_name} отменил рассмотрение сообщения #{msg_id}\n\nСообщение снова доступно для проверки.",
+                        reply_markup=review_keyboard,
+                        parse_mode=ParseMode.HTML
+                    )
             except:
                 pass
 
@@ -3112,8 +3244,13 @@ async def refresh_pending(callback: CallbackQuery):
         if len(display_text) > 30:
             display_text = display_text[:30] + "..."
         
-        text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
-        text += f"👤 ID: {user_id}\n"
+        # Для SUPER_ADMIN показываем ID
+        if callback.from_user.id == SUPER_ADMIN:
+            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+            text += f"👤 ID: {user_id}\n"
+        else:
+            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+        
         text += f"💬 {display_text}\n\n"
         
         keyboard.inline_keyboard.append([
@@ -3293,6 +3430,9 @@ async def run_http_server():
                 pending_count = 0
                 users_count = 0
             
+            mode, interval = get_current_mode_and_interval()
+            mode_text = "night" if mode == 'night' else "auto" if mode == 'auto' else "manual"
+            
             return web.json_response({
                 "status": "ok",
                 "bot_name": BOT_USERNAME,
@@ -3301,8 +3441,10 @@ async def run_http_server():
                 "pending_in_cache": len(pending_cache),
                 "pending_in_db": pending_count,
                 "total_users": users_count,
-                "night_mode": night_mode_enabled,
+                "night_mode_enabled": night_mode_enabled,
                 "maintenance": maintenance_mode,
+                "current_mode": mode_text,
+                "auto_interval_minutes": interval,
                 "blacklist_size": len(blacklist_cache),
                 "timestamp": datetime.utcnow().isoformat()
             })
@@ -3365,6 +3507,14 @@ async def main():
     logger.info(f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}")
     logger.info(f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}")
     logger.info(f"📚 Черный список: {len(blacklist_cache)} слов")
+    
+    # Проверяем наличие файла с центральным водяным знаком
+    if os.path.exists("watermark_center.png"):
+        logger.info("🖼 Центральный водяной знак: watermark_center.png найден")
+    else:
+        logger.warning("🖼 Центральный водяной знак не найден. Будет использован только текстовый водяной знак.")
+        logger.warning("   Поместите файл watermark_center.png в папку с ботом для активации фото-вставки.")
+    
     logger.info("=" * 50)
     
     try:
