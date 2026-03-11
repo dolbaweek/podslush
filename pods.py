@@ -551,7 +551,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
                     # Если пиксель не полностью прозрачный
                     if item[3] > 0:
                         # Устанавливаем прозрачность 40% (102 из 255)
-                        new_center_array.append((item[0], item[1], item[2], 130))
+                        new_center_array.append((item[0], item[1], item[2], 145))
                     else:
                         new_center_array.append(item)
                 
