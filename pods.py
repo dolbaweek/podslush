@@ -487,7 +487,7 @@ async def add_watermark_to_photo(photo_file_id: str) -> str:
         text_height = bbox[3] - bbox[1]
 
         # ПРОЗРАЧНОСТЬ ТЕКСТА - 50% (как в оригинале)
-        fill_color = (0, 0, 0, 128)  # 50% opacity
+        fill_color = (0, 0, 0, 0)  # 50% opacity
 
         # ПОЗИЦИИ ПО ГОРИЗОНТАЛИ - три колонки
         positions_x = [
