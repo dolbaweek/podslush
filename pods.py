@@ -1496,10 +1496,27 @@ async def create_poll_start(message: Message, state: FSMContext):
     
     # Проверяем кулдаун
     if user_id in user_message_cooldown:
-        remaining = user_message_cooldown[user_id]
-        minutes = remaining // 60
-        seconds = remaining % 60
-        await message.answer(f"⏳ Подождите {minutes} мин {seconds} сек перед созданием опроса.")
+        await message.answer("⏳ Подождите 30 секунд перед созданием нового опроса.")
+        return
+    
+    # Проверяем техработы
+    if maintenance_mode:
+        try:
+            async with db_pool.acquire() as db:
+                cursor = await db.execute(
+                    "SELECT maintenance_exception FROM users WHERE user_id=?",
+                    (user_id,)
+                )
+                result = await cursor.fetchone()
+                if not result or not result[0]:
+                    await message.answer(MAINTENANCE_MESSAGE)
+                    return
+        except Exception as e:
+            logger.error(f"DB error in maintenance check: {e}")
+    
+    # Проверяем капчу
+    if not await check_user_captcha(user_id):
+        await message.answer("🤖 Сначала пройдите проверку. Отправьте любое сообщение.")
         return
     
     await state.set_state(AdminStates.waiting_for_poll_question)
@@ -1516,6 +1533,22 @@ async def poll_question(message: Message, state: FSMContext):
     if message.from_user.id in ADMINS:
         await state.clear()
         return
+    
+    # Проверяем техработы
+    if maintenance_mode:
+        try:
+            async with db_pool.acquire() as db:
+                cursor = await db.execute(
+                    "SELECT maintenance_exception FROM users WHERE user_id=?",
+                    (message.from_user.id,)
+                )
+                result = await cursor.fetchone()
+                if not result or not result[0]:
+                    await message.answer(MAINTENANCE_MESSAGE)
+                    await state.clear()
+                    return
+        except Exception as e:
+            logger.error(f"DB error in maintenance check: {e}")
     
     if message.text == "/cancel":
         await state.clear()
@@ -1553,6 +1586,22 @@ async def poll_options(message: Message, state: FSMContext):
         await state.clear()
         return
     
+    # Проверяем техработы
+    if maintenance_mode:
+        try:
+            async with db_pool.acquire() as db:
+                cursor = await db.execute(
+                    "SELECT maintenance_exception FROM users WHERE user_id=?",
+                    (message.from_user.id,)
+                )
+                result = await cursor.fetchone()
+                if not result or not result[0]:
+                    await message.answer(MAINTENANCE_MESSAGE)
+                    await state.clear()
+                    return
+        except Exception as e:
+            logger.error(f"DB error in maintenance check: {e}")
+    
     if message.text == "/cancel":
         await state.clear()
         await message.answer("❌ Создание опроса отменено")
@@ -1576,6 +1625,11 @@ async def poll_options(message: Message, state: FSMContext):
     
     data = await state.get_data()
     question = data.get("poll_question")
+    
+    if not question:
+        await message.answer("❌ Ошибка: вопрос не найден. Начните заново.")
+        await state.clear()
+        return
     
     # Сохраняем опрос в БД
     poll_data = json.dumps({
@@ -1613,8 +1667,9 @@ async def poll_options(message: Message, state: FSMContext):
         await state.clear()
         return
     
+    # Обновляем кэш и ставим кулдаун
     user_cache[message.from_user.id] = {'banned': False, 'mute_until': None, 'last_message': now}
-    user_message_cooldown[message.from_user.id] = 30
+    user_message_cooldown[message.from_user.id] = True
     pending_cache.clear()
     
     await message.answer("✅ Опрос отправлен на модерацию!")
@@ -1624,7 +1679,7 @@ async def poll_options(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="🔍 Перейти к опросу", callback_data=f"review_{msg_id}")]
     ])
     
-    options_preview = "\n".join([f"• {opt}" for opt in options])
+    options_preview = "\n".join([f"• {escape_html(opt)}" for opt in options])
     
     for admin in ADMINS:
         try:
@@ -1633,7 +1688,7 @@ async def poll_options(message: Message, state: FSMContext):
                     admin,
                     f"📊 <b>Новый опрос</b>\n\n"
                     f"<b>Вопрос:</b> {escape_html(question)}\n\n"
-                    f"<b>Варианты:</b>\n{escape_html(options_preview)}\n\n"
+                    f"<b>Варианты:</b>\n{options_preview}\n\n"
                     f"🆔 <code>{message.from_user.id}</code>\n"
                     f"👤 @{message.from_user.username or 'нет'}",
                     reply_markup=keyboard,
@@ -1644,7 +1699,7 @@ async def poll_options(message: Message, state: FSMContext):
                     admin,
                     f"📊 <b>Новый опрос</b>\n\n"
                     f"<b>Вопрос:</b> {escape_html(question)}\n\n"
-                    f"<b>Варианты:</b>\n{escape_html(options_preview)}",
+                    f"<b>Варианты:</b>\n{options_preview}",
                     reply_markup=keyboard,
                     parse_mode=ParseMode.HTML
                 )
@@ -1652,17 +1707,6 @@ async def poll_options(message: Message, state: FSMContext):
             logger.error(f"Error sending poll to admin: {e}")
     
     await state.clear()
-
-@dp.message(F.text == "❌ Закрыть меню")
-async def close_menu(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
-        return
-    
-    await state.clear()
-    await message.answer(
-        "Меню закрыто. Чтобы открыть снова, напишите /start",
-        reply_markup=ReplyKeyboardRemove()
-    )
 
 # ================= ПЕРЕКЛЮЧАТЕЛИ РЕЖИМОВ =================
 
