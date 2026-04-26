@@ -2087,7 +2087,7 @@ async def export_history(callback: CallbackQuery):
 
 # ================= СТАТИСТИКА =================
 
-@dp.message(F.text == "📊 Статистика")
+@@dp.message(F.text == "📊 Статистика")
 async def admin_stats(message: Message):
     if message.from_user.id not in ADMINS:
         return
@@ -2244,6 +2244,40 @@ async def check_user_captcha(user_id: int) -> bool:
             return result and result[0] == 1
     except:
         return False
+
+async def set_captcha_passed(user_id: int):  # ← ВОТ ЭТУ ФУНКЦИЮ ДОБАВЬ
+    """Отмечает, что пользователь прошел капчу"""
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE users SET captcha_passed=1 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+        logger.info(f"Captcha passed for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error setting captcha passed: {e}")
+
+def generate_captcha() -> tuple:
+    """Генерирует простую математическую капчу"""
+    a = random.randint(1, 20)
+    b = random.randint(1, 20)
+    operations = ['+', '-', '*']
+    op = random.choice(operations)
+    
+    if op == '+':
+        answer = a + b
+        question = f"{a} + {b}"
+    elif op == '-':
+        answer = a - b
+        question = f"{a} - {b}"
+    else:
+        a = random.randint(1, 10)
+        b = random.randint(1, 10)
+        answer = a * b
+        question = f"{a} × {b}"
+    
+    return question, str(answer)
 
 # ================= ОБРАБОТЧИК СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ =================
 
