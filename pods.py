@@ -4789,36 +4789,36 @@ async def run_http_server():
                 return web.json_response({"error": str(e)}, status=500)
         
         # ==================== API: НАСТРОЙКИ ====================
-        
+   
         async def api_settings(request):
-    if request.method == 'GET':
-        try:
-            async with db_pool.acquire() as db:
-                cursor = await db.execute("SELECT key, value FROM settings")
-                settings = await cursor.fetchall()
-                result = {}
-                for key, value in settings:
-                    result[key] = value
-                result['maintenance'] = '1' if maintenance_mode else '0'
-                return web.json_response(result)
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+            if request.method == 'GET':
+                try:
+                    async with db_pool.acquire() as db:
+                        cursor = await db.execute("SELECT key, value FROM settings")
+                        settings = await cursor.fetchall()
+                        result = {}
+                        for key, value in settings:
+                            result[key] = value
+                        result['maintenance'] = '1' if maintenance_mode else '0'
+                        return web.json_response(result)
+                except Exception as e:
+                    return web.json_response({"error": str(e)}, status=500)
 
-    if request.method == 'POST':
-        try:
-            data = await request.json()
-            async with db_pool.acquire() as db:
-                for key, value in data.items():
-                    await db.execute(
-                        "UPDATE settings SET value=? WHERE key=?",
-                        (str(value), key)
-                    )
-                await db.commit()
-            return web.json_response({"success": True})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+            if request.method == 'POST':
+                try:
+                    data = await request.json()
+                    async with db_pool.acquire() as db:
+                        for key, value in data.items():
+                            await db.execute(
+                                "UPDATE settings SET value=? WHERE key=?",
+                                (str(value), key)
+                            )
+                        await db.commit()
+                    return web.json_response({"success": True})
+                except Exception as e:
+                    return web.json_response({"error": str(e)}, status=500)
 
-    return web.json_response({"error": "Method not allowed"}, status=405)
+            return web.json_response({"error": "Method not allowed"}, status=405)
         
         # ==================== НАСТРОЙКА ПРИЛОЖЕНИЯ ====================
         
