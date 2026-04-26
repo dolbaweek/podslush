@@ -1085,40 +1085,161 @@ async def faq_answer(callback: CallbackQuery):
     
     await callback.answer()
 
-@dp.message(F.text)
-async def faq_search(message: Message, state: FSMContext):
-    """Поиск по FAQ по ключевым словам"""
-    current_state = await state.get_state()
+@dp.message(F.text == "❔ FAQ")
+async def faq_button(message: Message):
+    """Показывает список FAQ с поиском"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Поиск по FAQ", callback_data="faq_search")],
+        [InlineKeyboardButton(text="📋 Все вопросы", callback_data="faq_show_all")]
+    ])
     
-    # Проверяем, не в режиме ли ответа на FAQ
-    if current_state == "AdminStates:waiting_for_faq_question":
+    await message.answer(
+        "❔ <b>Часто задаваемые вопросы</b>\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "faq_search")
+async def faq_search_prompt(callback: CallbackQuery, state: FSMContext):
+    """Запрашивает поисковый запрос"""
+    await state.set_state(AdminStates.waiting_for_faq_question)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="faq_cancel_search")]
+    ])
+    
+    await callback.message.answer(
+        "🔍 Введите ключевое слово для поиска:\n"
+        "Например: правила, опрос, публикация, отправить\n\n"
+        "Или нажмите кнопку для выхода из поиска.",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_faq_question)
+async def faq_search_result(message: Message, state: FSMContext):
+    """Обрабатывает поисковый запрос FAQ"""
+    
+    # Проверяем команду отмены
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Поиск отменен")
         return
     
-    # Ищем совпадения в FAQ
-    search_text = message.text.lower()
+    search_text = message.text.strip().lower()
+    
+    if len(search_text) < 2:
+        await message.answer("❌ Слишком короткий запрос. Минимум 2 символа.")
+        return
     
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute("SELECT question, answer, keywords FROM faq")
             all_faqs = await cursor.fetchall()
     except Exception as e:
-        return  # Если не FAQ, пропускаем
+        logger.error(f"Error searching FAQ: {e}")
+        await message.answer("❌ Ошибка поиска")
+        await state.clear()
+        return
     
-    # Простой поиск по ключевым словам
     found = []
     for question, answer, keywords in all_faqs:
-        keywords_list = keywords.split(',')
-        for keyword in keywords_list:
-            if keyword.strip() in search_text:
-                found.append((question, answer))
-                break
+        # Ищем в вопросе и ключевых словах
+        if search_text in question.lower():
+            found.append((question, answer, 1))  # Приоритет 1 - совпадение в вопросе
+        else:
+            keywords_list = keywords.split(',')
+            for keyword in keywords_list:
+                if keyword.strip() in search_text or search_text in keyword.strip():
+                    found.append((question, answer, 2))  # Приоритет 2 - совпадение в ключах
+                    break
+    
+    # Сортируем по приоритету
+    found.sort(key=lambda x: x[2])
     
     if found:
-        # Показываем до 3 результатов
-        for question, answer in found[:3]:
-            await message.answer(f"❔ <b>{question}</b>\n\n{answer}")
-            await asyncio.sleep(0.2)
-    # Если не нашли - не отвечаем, пусть идет как обычное сообщение
+        await message.answer(f"🔍 Найдено результатов: {len(found)}\n")
+        
+        for question, answer, _ in found[:5]:  # Показываем до 5 результатов
+            await message.answer(
+                f"❔ <b>{question}</b>\n\n{answer}\n\n"
+                f"━━━━━━━━━━━━━━━━"
+            )
+            await asyncio.sleep(0.3)
+        
+        if len(found) > 5:
+            await message.answer(f"... и ещё {len(found) - 5} результатов. Уточните запрос.")
+    else:
+        await message.answer(
+            "❌ Ничего не найдено.\n\n"
+            "Попробуйте другие ключевые слова или посмотрите все вопросы."
+        )
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "faq_show_all")
+async def faq_show_all(callback: CallbackQuery):
+    """Показывает все FAQ вопросы"""
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
+            faqs = await cursor.fetchall()
+    except:
+        await callback.answer("Ошибка загрузки")
+        return
+    
+    if not faqs:
+        await callback.message.answer("❔ FAQ пока пуст")
+        await callback.answer()
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=question, callback_data=f"faq_{faq_id}")]
+        for faq_id, question in faqs[:15]
+    ])
+    
+    await callback.message.answer(
+        "❔ <b>Все вопросы FAQ:</b>\n\n"
+        "Выберите интересующий вопрос:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "faq_cancel_search")
+async def faq_cancel_search(callback: CallbackQuery, state: FSMContext):
+    """Отменяет поиск FAQ"""
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer("Поиск отменен")
+
+@dp.callback_query(F.data.startswith("faq_"))
+async def faq_answer(callback: CallbackQuery):
+    """Показывает ответ на FAQ"""
+    if callback.data in ["faq_search", "faq_show_all", "faq_cancel_search"]:
+        return
+    
+    faq_id = int(callback.data.split("_")[1])
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT question, answer FROM faq WHERE id=?",
+                (faq_id,)
+            )
+            result = await cursor.fetchone()
+            
+            if result:
+                question, answer = result
+                await callback.message.answer(
+                    f"❔ <b>{question}</b>\n\n{answer}"
+                )
+            else:
+                await callback.answer("Вопрос не найден", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error getting FAQ answer: {e}")
+        await callback.answer("Ошибка загрузки ответа", show_alert=True)
+    
+    await callback.answer()
 
 ## ================= ВЕБ-ПАНЕЛЬ (Web App) =================
 
