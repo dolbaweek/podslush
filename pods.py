@@ -74,6 +74,7 @@ blacklist_cache = TTLCache(maxsize=1000, ttl=300)
 user_message_cooldown = TTLCache(maxsize=1000, ttl=1800)
 captcha_cache = TTLCache(maxsize=1000, ttl=600)  # Для хранения капчи
 faq_cache = TTLCache(maxsize=100, ttl=3600)  # Кэш FAQ
+poll_cooldown = TTLCache(maxsize=1000, ttl=30)
 
 # Флаги
 night_mode_enabled = False
@@ -1495,7 +1496,7 @@ async def create_poll_start(message: Message, state: FSMContext):
         return
     
     # Проверяем кулдаун
-    if user_id in user_message_cooldown:
+    if user_id in poll_cooldown:
         await message.answer("⏳ Подождите 30 секунд перед созданием нового опроса.")
         return
     
@@ -1669,7 +1670,7 @@ async def poll_options(message: Message, state: FSMContext):
     
     # Обновляем кэш и ставим кулдаун
     user_cache[message.from_user.id] = {'banned': False, 'mute_until': None, 'last_message': now}
-    user_message_cooldown[message.from_user.id] = True
+    poll_cooldown[message.from_user.id] = True
     pending_cache.clear()
     
     await message.answer("✅ Опрос отправлен на модерацию!")
