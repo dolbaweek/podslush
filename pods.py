@@ -2424,21 +2424,56 @@ async def handle_user_media(message: Message, state: FSMContext):
     """Обработка сообщений от обычных пользователей"""
     
     # ========== ПРОВЕРКА ДЛЯ АДМИНОВ ==========
-    # Если это админ и он нажал кнопку меню - пропускаем к специализированным хендлерам
     if message.from_user.id in ADMINS:
-        admin_buttons = [
-            "🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями",
-            "📨 Ожидающие проверки", "❌ Закрыть меню", "⏳ Временный мут",
-            "📋 История действий", "📝 Черный список слов", "❓ Управление FAQ",
-            "🌐 Веб-панель", "👥 Управление исключениями",
-            "🌙 Ночной режим", "☀️ Авто-режим", "🛠 Техработы"
-        ]
-        if message.text in admin_buttons:
-            return False  # Пропускаем к специализированным хендлерам
-        return  # Игнорируем обычные сообщения от админов
+        # Обрабатываем админские кнопки прямо здесь
+        if message.text and message.text.startswith("🌙"):
+            await toggle_night_mode(message)
+            return
+        elif message.text and message.text.startswith("☀️"):
+            await toggle_auto_mode(message)
+            return
+        elif message.text and message.text.startswith("🛠"):
+            await toggle_maintenance(message)
+            return
+        elif message.text == "🎨 Сменить стиль":
+            await admin_style(message)
+            return
+        elif message.text == "📊 Статистика":
+            await admin_stats(message)
+            return
+        elif message.text == "👥 Управление пользователями":
+            await admin_users(message, state)
+            return
+        elif message.text == "📨 Ожидающие проверки":
+            await admin_pending_messages(message)
+            return
+        elif message.text == "⏳ Временный мут":
+            await temporary_mute_menu(message, state)
+            return
+        elif message.text == "📋 История действий":
+            await show_admin_history(message)
+            return
+        elif message.text == "📝 Черный список слов":
+            await blacklist_menu(message)
+            return
+        elif message.text == "❓ Управление FAQ":
+            await manage_faq(message)
+            return
+        elif message.text == "🌐 Веб-панель":
+            await open_web_panel(message)
+            return
+        elif message.text == "👥 Управление исключениями":
+            await manage_exceptions(message)
+            return
+        elif message.text == "❌ Закрыть меню":
+            await close_menu(message, state)
+            return
+        else:
+            # Игнорируем все остальные сообщения от админов
+            return
     # ==========================================
 
-    # Проверяем, не в состоянии ли FSM
+    # Проверяем, не в состоянии ли FSM (кроме разрешенных)
     current_state = await state.get_state()
     if current_state is not None:
         allowed_states = [
@@ -2491,7 +2526,7 @@ async def handle_user_media(message: Message, state: FSMContext):
                 )
                 return
             else:
-                # Неправильный ответ
+                # Неправильный ответ - генерируем новую капчу
                 question, answer = generate_captcha()
                 captcha_cache[user_id] = answer
                 await message.answer(
