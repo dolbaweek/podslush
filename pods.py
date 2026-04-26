@@ -14,6 +14,11 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import tempfile
 import html
+import random
+import hashlib
+import hmac
+import json
+from urllib.parse import unquote
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -24,7 +29,8 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
-    FSInputFile
+    FSInputFile,
+    WebAppInfo
 )
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -40,6 +46,7 @@ CHANNEL_ID = int(os.getenv('CHANNEL_ID', "-1003713957228"))
 SUPER_ADMIN = int(os.getenv('SUPER_ADMIN', "8438783644"))
 ADMINS = [int(x) for x in os.getenv('ADMINS', "8438783644,8488564574,8283468381").split(',')]
 BOT_USERNAME = os.getenv('BOT_USERNAME', "pods10_bot")
+WEB_APP_URL = os.getenv('WEB_APP_URL', "https://your-app.vercel.app")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -48,8 +55,8 @@ logger = logging.getLogger(__name__)
 
 NIGHT_MODE_START = 0
 NIGHT_MODE_END = 8
-NIGHT_POST_INTERVAL = 30  # 30 минут ночью
-AUTO_POST_INTERVAL = 5     # 5 минут днём
+NIGHT_POST_INTERVAL = 30
+AUTO_POST_INTERVAL = 5
 INSULT_THRESHOLD = 4
 LONG_MESSAGE_THRESHOLD = 60
 
@@ -65,253 +72,116 @@ admin_cache = TTLCache(maxsize=100, ttl=60)
 pending_cache = TTLCache(maxsize=200, ttl=30)
 blacklist_cache = TTLCache(maxsize=1000, ttl=300)
 user_message_cooldown = TTLCache(maxsize=1000, ttl=1800)
+captcha_cache = TTLCache(maxsize=1000, ttl=600)  # Для хранения капчи
+faq_cache = TTLCache(maxsize=100, ttl=3600)  # Кэш FAQ
 
 # Флаги
-night_mode_enabled = False  # Ночной режим (00:00-08:00, интервал 30 мин)
-auto_mode_enabled = False   # Автоматический режим (08:01-23:59, интервал 5 мин)
+night_mode_enabled = False
+auto_mode_enabled = False
 maintenance_mode = False
 maintenance_exceptions = set()
 shutdown_flag = False
 start_time = time.time()
 
-# Блокировка для автоматической публикации
+# Блокировка для публикации
 publish_lock = asyncio.Lock()
 
 # ================= БАЗОВЫЕ СПИСКИ СЛОВ =================
 
 DEFAULT_INSULTS = [
-    # ДУРАК / ТУПОСТЬ (все формы)
-    "дурак", "дурака", "дураку", "дураком", "дураке", "дураки", "дураков", "дуракам", "дураками",
-    "дура", "дуры", "дуре", "дуру", "дурой", "дур", "дурам", "дурами",
-    "дурачок", "дурачка", "дурачку", "дурачком", "дурацкий", "дурацкого", "дурацкие",
-    "идиот", "идиота", "идиоту", "идиотом", "идиоте", "идиоты", "идиотов", "идиотка", "идиотки",
-    "идиотский", "идиотический", "идиотизм",
-    "тупой", "тупого", "тупому", "тупым", "тупом", "тупая", "тупой", "тупую", "тупые", "тупых", "тупыми",
-    "тупица", "тупицы", "тупице", "тупицу", "тупицей", "тупиц",
-    "дебил", "дебила", "дебилу", "дебилом", "дебиле", "дебилы", "дебилов", "дебилка", "дебильной",
-    "дебильный", "дебильного", "дебильные",
-    "глупый", "глупого", "глупая", "глупой", "глупые", "глупых", "глупость",
-
-    # ЖИВОТНЫЕ КАК ОСКОРБЛЕНИЯ
-    "козел", "козла", "козлу", "козлом", "козле", "козлы", "козлов", "козлина", "козлище",
-    "козявка", "козявки", "козявку",
-    "баран", "барана", "барану", "бараном", "баране", "бараны", "баранов", "баранина",
-    "осел", "осла", "ослу", "ослом", "осле", "ослы", "ослов", "ослица",
-    "свинья", "свиньи", "свинье", "свинью", "свиньей", "свиней", "свиньям", "свиньями", "свин",
-    "собака", "собаки", "собаке", "собаку", "собакой", "псина", "псины", "псине",
-    "овца", "овцы", "овце", "овцу", "овцой", "овечка",
-    "корова", "коровы", "корове", "корову", "коровой",
-    "обезьяна", "обезьяны", "обезьяне", "обезьяну", "обезьяной",
-
+    # ДУРАК / ТУПОСТЬ
+    "дурак", "дурака", "дураку", "дураком", "дураке", "дураки", "дураков",
+    "дура", "дуры", "дуре", "дуру", "дурой",
+    "дурачок", "дурачка", "дурачку",
+    "идиот", "идиота", "идиоту", "идиотом", "идиотка",
+    "тупой", "тупого", "тупая", "тупую", "тупые",
+    "тупица", "тупицы",
+    "дебил", "дебила", "дебилу", "дебилы",
+    "глупый", "глупого", "глупость",
+    
+    # ЖИВОТНЫЕ
+    "козел", "козла", "козлу", "козлы",
+    "баран", "барана", "барану", "бараны",
+    "осел", "осла", "ослу", "ослы",
+    "свинья", "свиньи", "свинью",
+    "собака", "собаки", "псина",
+    "овца", "овцы",
+    "корова", "коровы",
+    "обезьяна", "обезьяны",
+    
     # НЕГАТИВНЫЕ ЛИЧНОСТИ
-    "сволочь", "сволочи", "сволочью", "сволочей", "сволочам", "сволочами",
-    "гад", "гада", "гаду", "гадом", "гаде", "гады", "гадов", "гадина", "гадине",
-    "тварь", "твари", "тварью", "тварей", "тварям", "тварями",
-    "урод", "урода", "уроду", "уродом", "уроде", "уроды", "уродов", "уродина", "уродский",
-    "мудак", "мудака", "мудаку", "мудаком", "мудаке", "мудаки", "мудаков", "мудацкий",
-    "придурок", "придурка", "придурку", "придурком", "придурке", "придурки", "придурков",
-    "лох", "лоха", "лоху", "лохом", "лохе", "лохи", "лохов", "лошок", "лошпеды",
-    "чмо", "чма", "чму", "чмом", "чмы", "чмов", "чмошник", "чмошный",
-    "падла", "падлы", "падле", "падлу", "падлой", "падло", "падлы", "падлам",
-    "гнида", "гниды", "гниде", "гниду", "гнидой", "гнид",
-    "мразь", "мрази", "мразью", "мразей", "мразотный",
-    "тварь", "твари", "тварью", "тварей",
-    "скотина", "скотины", "скотине", "скотину", "скотиной", "скот",
-    "стерва", "стервы", "стерве", "стерву", "стервой", "стервятник",
-
-    # РУССКИЙ МАТ (все формы)
-    # ХУЙ
-    "хуй", "хуя", "хую", "хуем", "хуе", "хуи", "хуёв", "хуям", "хуями", "хуях",
-    "хуйня", "хуйни", "хуйне", "хуйню", "хуйней", "хуйнуть", "хуйнул",
-    "хуёвый", "хуёвого", "хуёвому", "хуёвым", "хуёвая", "хуёвой", "хуёвые",
-    "нахуй", "нахуя", "похуй", "дохуя", "охуеть", "охуел", "охуела", "охуели", "охуенно",
-    "ахуеть", "ахуел", "ахуела", "ахуели", "ахуенный",
-    "распиздяй", "распиздяя",
-    # ПИЗДА
-    "пизда", "пизды", "пизде", "пизду", "пиздой", "пизд", "пиздам", "пиздами",
-    "пиздец", "пиздеца", "пиздецу", "пиздецом", "пиздатый", "пиздатую",
-    "пиздить", "пизжу", "пиздит", "пиздил", "пиздила", "пиздюк", "пиздюка", "пиздюки",
-    "пиздюлька", "пиздобратия", "пиздобратии",
-    "распиздяй", "распиздяя", "распиздяйство",
-    "запиздярить", "запиздярил",
-    "пропиздеть", "пропиздел",
-    # БЛЯДЬ
-    "блядь", "бляди", "блядью", "блядей", "блядям", "блядями",
-    "бля", "блять", "блэ", "бляха",
-    "блядский", "блядского", "блядские",
-    "блядство", "блядства", "блядству",
-    "блядовать", "блядует", "блядовал",
-    "заблядовать", "проблядовать",
-    # СУКА
-    "сука", "суки", "суке", "суку", "сукой", "сук", "сукам", "суками",
-    "сучка", "сучки", "сучке", "сучку", "сучкой", "сучек",
-    "сучонок", "сучонка", "сучонку", "сучёныш",
-    "сучья", "сучью", "сучьей",
-    "сукин", "сукина", "сукину", "сукиным",
-    # ЕБАТЬ
-    "ебать", "ебу", "ебет", "ебут", "ебал", "ебала", "ебали", "еби", "ебите",
-    "ебануть", "ебанул", "ебанула", "ебанёт",
-    "ебанутый", "ебанутого", "ебанутая", "ебанутую", "ебанутые",
-    "ёбаный", "ёбаного", "ёбаную", "ёбаные", "ёбаных",
-    "заебать", "заебал", "заебала", "заебали", "заебёт", "заеби",
-    "наебать", "наебал", "наебала", "наебут", "наебалово",
-    "поебать", "поебал", "поебала",
-    "разъебай", "разъебая", "разъебаи",
-    "ебля", "ебли", "еблей",
-    "ебарь", "ебарей",
-    "ебло", "ебла", "ебу", "еблом", "еблет", "ебальник",
-    # ПИДОР
-    "пидор", "пидора", "пидору", "пидором", "пидоре", "пидоры", "пидоров",
-    "пидорас", "пидораса", "пидорасу", "пидорасом", "пидорасе", "пидорасы",
-    "пидрила", "пидрилы", "пидриле", "пидрилу", "пидрилой",
-    "пидорня", "пидорни", "пидорне",
-    "пидорский", "пидорского", "пидорские",
-    "пидорашка", "пидорашки", "пидорашку",
-    "pidor", "pidora", "pidoru", "pidorom",
-    # ЗАЛУПА
-    "залупа", "залупы", "залупе", "залупу", "залупой", "залуп",
-    "залупень", "залупня", "залупню", "залупнем",
-    "залупный", "залупного", "залупные",
-    # ГАНДОН
-    "гандон", "гандона", "гандону", "гандоном", "гандоне", "гандопень",
-    "гондон", "гондона", "гондону", "гондоном",
-    # ШЛЮХА
-    "шлюха", "шлюхи", "шлюхе", "шлюху", "шлюхой", "шлюх", "шлюхам", "шлюхами",
-    "шлюшка", "шлюшки", "шлюшку", "шлюшек",
-    "проститутка", "проститутки", "проститутке", "проститутку", "проституткой", "проституток",
-    "проститутский", "проституточный",
-    "курва", "курвы", "курве", "курву", "курвой",
-    "сучара", "сучары", "сучаре", "сучару", "сучарой",
-    "потаскуха", "потаскухи", "потаскухе", "потаскуху", "потаскухой",
-    "блядун", "блядуна", "блядуну", "блядуном",
-    "блядища", "блядищи", "блядище", "блядищу",
-
-    # ДОЛБОЕБ / ЕБЛАН
-    "долбоеб", "долбоеба", "долбоебу", "долбоебом", "долбоебе", "долбоебы", "долбоебов",
-    "долбоящер", "долбоящера", "долбоящеры",
-    "еблан", "еблана", "еблану", "ебланом", "еблане", "ебланы", "ебланов",
-    "ебланчик", "ебланский",
-    "мудак", "мудака", "мудаку", "мудаком", "мудаке", "мудаки", "мудаков", "мудацкий",
-    "мудила", "мудилы", "мудиле", "мудилу", "мудилой",
-    "мудень", "мудня", "муднем",
-    "мудозвон", "мудозвона", "мудозвоны",
-
-    # РАЗНЫЕ ОСКОРБЛЕНИЯ
-    "чурка", "чурки", "чурке", "чурку", "чуркой",
-    "хач", "хача", "хачу", "хачем", "хачи", "хачей",
-    "жид", "жида", "жиду", "жидом", "жиды", "жидов",
-    "хохол", "хохла", "хохлу", "хохлом", "хохлы", "хохлов",
-    "кацап", "кацапа", "кацапу", "кацапом",
-    "пшек", "пшека", "пшеку", "пшеки",
-
-    # УСИЛИТЕЛИ
-    "ёбаный в рот", "ёбаного в рот", "ёбанные",
-    "распидорасия", "пидоры",
-    "охуительный", "охуительного",
-    "наебениться", "наебенился"
+    "сволочь", "сволочи",
+    "гад", "гада", "гады",
+    "тварь", "твари",
+    "урод", "урода", "уроды",
+    "мудак", "мудака", "мудаки",
+    "придурок", "придурка",
+    "лох", "лоха", "лохи",
+    "чмо", "чма",
+    "падла", "падлы",
+    "гнида", "гниды",
+    "мразь", "мрази",
+    "скотина", "скотины",
+    "стерва", "стервы",
+    
+    # МАТ
+    "хуй", "хуя", "хую", "хуем",
+    "хуйня", "хуйни",
+    "пизда", "пизды", "пизде",
+    "пиздец", "пиздеца",
+    "блядь", "бляди", "бля",
+    "сука", "суки", "суку", "сучка",
+    "ебать", "ебу", "ебет", "ебал",
+    "пидор", "пидора", "пидоры",
+    "залупа", "залупы",
+    "гандон", "гандона",
+    "шлюха", "шлюхи",
+    "долбоеб", "долбоеба",
+    "еблан", "еблана",
+    
+    # НАЦИОНАЛЬНЫЕ
+    "чурка", "чурки",
+    "хач", "хача", "хачи",
+    "жид", "жида", "жиды",
+    "хохол", "хохла",
+    "кацап", "кацапа",
 ]
 
 IMMORAL_CONTENT = [
-    # СЕКС / ПОРНО / ЭРОТИКА
-    "секс", "секса", "сексу", "сексом", "сексе", "сексуальный", "сексуального", "сексуальные",
-    "порно", "порна", "порнуха", "порнухи", "порнушный", "порнографический",
-    "эротика", "эротики", "эротикой", "эротичный", "эротического",
-    "интим", "интима", "интимом", "интимный", "интимного", "интимные", "интимность",
-
-    # ГОЛЫЙ / ОБНАЖЕННЫЙ
-    "голая", "голой", "голую", "голые", "голых", "голыми", "голый", "голого", "голому", "голым",
-    "обнаженная", "обнаженной", "обнаженную", "обнаженные", "обнаженных", "обнаженными",
-    "обнаженный", "обнаженного", "обнаженному", "обнаженным", "обнажен",
-    "нагая", "нагой", "нагую", "нагие", "нагих", "нагой", "нагое",
-
-    # ЧАСТИ ТЕЛА
-    "писька", "письки", "письке", "письку", "писькой", "писюн", "писюна", "писюнчик",
-    "пися", "писи", "писе", "писю", "писей", "писям",
-    "попа", "попы", "попе", "попу", "попой", "попка", "попки", "попку", "попке",
-    "жопа", "жопы", "жопе", "жопу", "жопой", "жопка", "жопки", "жопный",
-    "сиськи", "сисек", "сиськам", "сиськами", "сиськах", "сися", "сисы", "сисечка",
-    "титьки", "тите", "титьками", "титькам", "сиськ",
-    "член", "члена", "члену", "членом", "члене", "члены", "членов", "членам", "членами",
-    "хуй", "хуя", "хую", "хуем", "хуе", "хуи", "хуёв", "хуйня", "хуйни",
-    "пенис", "пениса", "пенису", "пенисом", "пенисе", "пенисы", "пенисов",
-    "вагина", "вагины", "вагине", "вагину", "вагиной", "вагинальный",
-    "влагалище", "влагалища", "влагалищу", "влагалищем", "влагалищ",
-
-    # ДЕЙСТВИЯ
-    "лизнуть", "лизнул", "лизнула", "лизнули", "лизнешь", "лижет", "лижешь",
-    "облизать", "оближу", "оближет", "облизал", "облизала", "оближи", "оближите",
-    "лизать", "лижу", "лижет", "лижут", "лизал", "лизала", "лижи",
-    "вылизать", "вылижу", "вылижет", "вылизал", "вылизала",
-    "сосать", "сосу", "сосет", "сосут", "сосал", "сосала", "соси", "сосите",
-    "отсосать", "отсосу", "отсосет", "отсосут", "отсосал", "отсосала", "отсоси",
-    "засосать", "засосу", "засосет", "засосал", "засосала",
-
-    # СЕМЯ / ЭЯКУЛЯЦИЯ
-    "кончить", "кончу", "кончит", "кончат", "кончил", "кончила", "кончай",
-    "сперма", "спермы", "сперме", "сперму", "спермой",
-    "эякуляция", "эякуляции", "эякуляцией", "эякулировать", "эякулировал",
-    "семяизвержение", "семяизвержения",
-    "мастурбация", "мастурбации", "мастурбацией", "мастурбировать", "мастурбирует", "мастурбировал",
-    "дрочить", "дрочу", "дрочит", "дрочат", "дрочил", "дрочила", "дрочи",
-    "дрочка", "дрочки", "дрочке", "дрочку", "дрочкой",
-
-    # НОГИ / СТУПНИ
-    "ножки", "ножек", "ножкам", "ножками", "ножках", "ножка", "ножку", "ножке",
-    "ноги", "ног", "ногам", "ногами", "ногах", "нога", "ногу", "ногой",
-    "ступни", "ступней", "ступням", "ступнями", "ступнях", "ступня", "ступню", "ступней",
-    "пальцы ног", "пальцев ног", "пальцам ног", "пальцами ног", "пальчик ноги",
-    "облизать ноги", "оближет ноги", "лижет ноги", "лизать ноги", "лижу ноги",
-
-    # ПОЛОВОЙ АКТ
-    "трахнуть", "трахну", "трахнешь", "трахнет", "трахнут", "трахнул", "трахнула", "трахнули",
-    "трахать", "трахаю", "трахает", "трахают", "трахал", "трахала", "трахали",
-    "выебать", "выебу", "выебет", "выебут", "выебал", "выебала",
-    "ебаться", "ебусь", "ебется", "ебутся", "ебался", "ебалась", "ебитесь",
-    "совокупление", "совокупления", "совокуплению", "совокуплением",
-
-    # ВИДЫ СЕКСА
-    "оральный", "орального", "оральному", "оральным", "оральные",
-    "анальный", "анального", "анальному", "анальным", "анальные",
-    "минет", "минета", "минету", "минетом", "минете", "минетик",
-    "кунилингус", "кунилингуса", "кунилингусу", "кунилингусом",
-
-    # ПОРНОАКТЕРЫ
-    "порноактриса", "порноактрисы", "порноактрисе", "порноактрису", "порноактрисой",
-    "порноактер", "порноактера", "порноактеру", "порноактером", "порноактеры",
-
-    # ОРИЕНТАЦИИ И ПРАКТИКИ
-    "гей", "гея", "гею", "геем", "геи", "геев",
-    "лесбиянка", "лесбиянки", "лесбиянке", "лесбиянку", "лесбиянкой", "лесбиянок",
-    "бдсм", "бдсменит", "бдсмщик",
-    "жесткий секс", "жесткого секса", "жесткому сексу", "жестким сексом",
-    "групповуха", "групповухи", "групповухе", "групповуху", "групповухой",
-    "оргия", "оргии", "оргией", "оргию", "оргий",
-
-    # ПРЕДМЕТЫ
-    "презерватив", "презерватива", "презервативу", "презервативом", "презервативе", "презервативы",
-    "вибратор", "вибратора", "вибратору", "вибратором", "вибраторе", "вибраторы",
-    "дилдо", "дилда", "дилду", "дилдом",
-    "секс-игрушки", "секс-игрушек", "секс-игрушкам", "секс-игрушками",
-
-    # ТАБУ
-    "инцест", "инцеста", "инцесту", "инцестом",
-    "насилие", "насилия", "насилию", "насилием",
-    "изнасилование", "изнасилования", "изнасилованию", "изнасилованием",
-    "педофилия", "педофилии", "педофилией", "педофил",
-    "зоофилия", "зоофилии", "зоофилией", "зоофил",
-    "некрофилия", "некрофилии", "некрофилией", "некрофил"
+    "секс", "секса", "сексу",
+    "порно", "порна",
+    "эротика", "эротики",
+    "голая", "голой", "голые",
+    "обнаженная", "обнаженной",
+    "писька", "письки",
+    "попа", "попы",
+    "жопа", "жопы",
+    "сиськи", "сисек",
+    "член", "члена",
+    "вагина", "вагины",
+    "лизать", "лижет",
+    "сосать", "сосет",
+    "кончить", "кончил",
+    "сперма", "спермы",
+    "трахнуть", "трахнул",
+    "минет", "минета",
+    "гей", "гея", "геи",
+    "лесбиянка", "лесбиянки",
+    "инцест", "инцеста",
+    "педофил", "педофила",
+    "зоофил", "зоофила",
 ]
 
 IMMORAL_PATTERNS = [re.compile(rf'\b{re.escape(word)}\b', re.IGNORECASE) for word in IMMORAL_CONTENT]
 
 URL_PATTERNS = [
-    r'https?://\S+',           # http:// или https://
-    r't\.me/\S+',              # t.me ссылки
-    r'@\w+',                   # упоминания
-    r'(?:www\.)\S+',           # www.
-    r'\S+\.(ru|com|org|net|рф|su|xyz|top|club|site)\b',  # домены
-    r'(?:telegram|tg)\.me/\S+', # telegram.me
-    r'bit\.ly/\S+',            # сокращатели ссылок
+    r'https?://\S+',
+    r't\.me/\S+',
+    r'@\w+',
+    r'(?:www\.)\S+',
+    r'\S+\.(ru|com|org|net|рф|su|xyz|top|club|site)\b',
+    r'(?:telegram|tg)\.me/\S+',
+    r'bit\.ly/\S+',
     r'goo\.gl/\S+',
     r'vk\.com/\S+',
     r'youtube\.com/\S+',
@@ -324,18 +194,7 @@ MAINTENANCE_MESSAGE = (
     "🔧 <b>Технические работы</b>\n\n"
     "В настоящее время проводятся технические работы. "
     "Воспользоваться ботом временно невозможно.\n\n"
-    "Вы можете отправить анонимное сообщение старым способом:\n"
-    "✉ <a href='https://t.me/anonaskbot?start=koafguk'>Анонимные сообщения</a>\n\n"
     "Приносим извинения за неудобства!"
-)
-
-ADMIN_MESSAGE_INFO = (
-    "📬 <b>Отправка сообщения администрации</b>\n\n"
-    "Вы можете написать личное сообщение администрации канала.\n"
-    "• Сообщение будет доставлено лично админам\n"
-    "• Отправлять можно <b>раз в 30 минут</b>\n"
-    "• Не злоупотребляйте, пожалуйста\n\n"
-    "Напишите ваше сообщение одним текстом:"
 )
 
 # ================= ФУНКЦИЯ ЭКРАНИРОВАНИЯ HTML =================
@@ -357,7 +216,12 @@ class AdminStates(StatesGroup):
     waiting_for_mute_duration = State()
     waiting_for_mute_user = State()
     waiting_for_admin_message = State()
-    waiting_for_reply_text = State()  # Новое состояние для ответов
+    waiting_for_reply_text = State()
+    waiting_for_captcha = State()
+    waiting_for_poll_question = State()
+    waiting_for_poll_options = State()
+    waiting_for_faq_question = State()
+    waiting_for_faq_add = State()
 
 # ================= ПУЛ БАЗЫ ДАННЫХ =================
 
@@ -421,22 +285,15 @@ def has_immoral_content(text: str) -> bool:
     return False
 
 def get_current_mode_and_interval():
-    """
-    Определяет текущий режим работы и интервал публикации
-    Возвращает: (режим, интервал в минутах)
-    режим: 'night' (ночной), 'auto' (автоматический дневной), 'manual' (ручной)
-    """
     now_utc = datetime.utcnow()
     now_msk = now_utc + timedelta(hours=3)
     hour = now_msk.hour
     
-    # Ночной режим: 00:00 - 08:00
     if hour < 8:
         if night_mode_enabled:
             return 'night', NIGHT_POST_INTERVAL
         else:
             return 'night_disabled', NIGHT_POST_INTERVAL
-    # Автоматический режим: 08:01 - 23:59
     else:
         if auto_mode_enabled:
             return 'auto', AUTO_POST_INTERVAL
@@ -444,201 +301,37 @@ def get_current_mode_and_interval():
             return 'auto_disabled', AUTO_POST_INTERVAL
 
 def can_auto_post_now() -> bool:
-    """Проверяет, можно ли сейчас публиковать автоматически"""
     now_utc = datetime.utcnow()
     now_msk = now_utc + timedelta(hours=3)
     hour = now_msk.hour
     
-    if hour < 8:  # Ночное время
+    if hour < 8:
         return night_mode_enabled
-    else:  # Дневное время
+    else:
         return auto_mode_enabled
 
-# ================= ВОДЯНОЙ ЗНАК (15 ТЕКСТОВЫХ + ЦЕНТРАЛЬНОЕ ФОТО) =================
+# ================= ГЕНЕРАЦИЯ КАПЧИ =================
 
-async def add_watermark_to_photo(photo_file_id: str) -> str:
-    """
-    Накладывает:
-    - 15 мелких полупрозрачных текстовых знаков @podslu10 (3 колонки по 5)
-    - Полупрозрачное фото по центру (watermark_center.png) - теперь более заметное
-    """
-    try:
-        # Скачиваем фото пользователя
-        file = await bot.get_file(photo_file_id)
-        photo_bytes = await bot.download_file(file.file_path)
-
-        # Открываем изображение пользователя
-        img = Image.open(photo_bytes).convert("RGBA")
-        width, height = img.size
-
-        # ===== 1. ТЕКСТОВЫЕ ВОДЯНЫЕ ЗНАКИ (15 штук) =====
-        txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
-        draw = ImageDraw.Draw(txt_layer)
-
-        # Текст водяного знака
-        text = "@podslu10"
-        
-        # РАЗМЕР ШРИФТА - 4% от ширины
-        font_size = max(16, int(width * 0.04))
-        
-        # Пробуем использовать разные шрифты
-        font = None
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except:
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
-            except:
-                try:
-                    font = ImageFont.truetype("C:\\Windows\\Fonts\\Arial.ttf", font_size)
-                except:
-                    font = ImageFont.load_default()
-
-        # Получаем размер текста
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-
-        # ПРОЗРАЧНОСТЬ ТЕКСТА - 50% (как в оригинале)
-        fill_color = (0, 0, 0, 0)  # 50% opacity
-
-        # ПОЗИЦИИ ПО ГОРИЗОНТАЛИ - три колонки
-        positions_x = [
-            int(width * 0.12),  # слева
-            int(width * 0.5),   # центр
-            int(width * 0.88)   # справа
-        ]
-
-        # ПОЗИЦИИ ПО ВЕРТИКАЛИ - 5 знаков
-        positions_y = []
-        for i in range(5):
-            y = int(height * (0.1 + i * 0.2))  # 10%, 30%, 50%, 70%, 90%
-            positions_y.append(y)
-
-        # Заполняем все колонки
-        for col, x in enumerate(positions_x):
-            for row, y in enumerate(positions_y):
-                # Небольшое случайное смещение
-                offset_x = int(text_width * 0.2) * (hash(f"{col}{row}") % 3 - 1)
-                offset_y = int(text_height * 0.2) * (hash(f"{col}{row}") % 3 - 1)
-                
-                final_x = x + offset_x
-                final_y = y + offset_y
-                
-                # Центрируем текст
-                draw_x = final_x - text_width // 2
-                draw_y = final_y - text_height // 2
-                
-                draw.text(
-                    (draw_x, draw_y), 
-                    text, 
-                    font=font, 
-                    fill=fill_color
-                )
-
-        # ===== 2. ЦЕНТРАЛЬНОЕ ФОТО-ВСТАВКА =====
-        center_watermark_path = "watermark_center.png"
-        
-        if os.path.exists(center_watermark_path):
-            try:
-                # Открываем центральный водяной знак
-                center_img = Image.open(center_watermark_path).convert("RGBA")
-                
-                # Получаем размеры центрального фото
-                c_width, c_height = center_img.size
-                
-                # Рассчитываем размер для центрального знака (40% от ширины фото - чуть больше)
-                target_size = int(width * 0.4)
-                
-                # Сохраняем пропорции
-                ratio = min(target_size / c_width, target_size / c_height)
-                new_size = (int(c_width * ratio), int(c_height * ratio))
-                
-                # Изменяем размер с сохранением пропорций
-                center_img = center_img.resize(new_size, Image.Resampling.LANCZOS)
-                
-                # ДЕЛАЕМ ЦЕНТРАЛЬНЫЙ ЗНАК БОЛЕЕ ЗАМЕТНЫМ (40% прозрачности)
-                center_array = center_img.getdata()
-                new_center_array = []
-                for item in center_array:
-                    # Если пиксель не полностью прозрачный
-                    if item[3] > 0:
-                        # Устанавливаем прозрачность 40% (102 из 255)
-                        new_center_array.append((item[0], item[1], item[2], 155))
-                    else:
-                        new_center_array.append(item)
-                
-                center_img.putdata(new_center_array)
-                
-                # Позиция для центрального знака (строго по центру)
-                center_x = (width - new_size[0]) // 2
-                center_y = (height - new_size[1]) // 2
-                
-                # Создаем слой для центрального знака
-                center_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
-                center_layer.paste(center_img, (center_x, center_y), center_img)
-                
-                # Объединяем текстовый слой и центральный слой
-                combined_layer = Image.alpha_composite(txt_layer, center_layer)
-                
-                logger.info(f"✅ Center watermark added: size={new_size[0]}x{new_size[1]}, opacity=40%")
-                
-            except Exception as e:
-                logger.error(f"❌ Error adding center watermark: {e}")
-                combined_layer = txt_layer
-        else:
-            logger.warning(f"⚠️ Center watermark file {center_watermark_path} not found. Using only text watermarks.")
-            combined_layer = txt_layer
-
-        # Объединяем оригинал со всеми водяными знаками
-        watermarked = Image.alpha_composite(img, combined_layer).convert("RGB")
-
-        # Сохраняем во временный файл
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
-            temp_path = tmp_file.name
-            watermarked.save(temp_path, format="JPEG", quality=95)
-
-        # Отправляем обратно в Telegram
-        msg = await bot.send_photo(
-            chat_id=SUPER_ADMIN,
-            photo=FSInputFile(temp_path)
-        )
-        
-        new_file_id = msg.photo[-1].file_id
-        os.unlink(temp_path)
-        
-        center_status = "with center photo (40% opacity)" if os.path.exists(center_watermark_path) else "without center photo"
-        logger.info(f"✅ Watermark added - 15 text marks (50% opacity) + {center_status}, size: {font_size}px")
-        return new_file_id
-
-    except Exception as e:
-        logger.error(f"❌ Watermark error: {e}")
-        return photo_file_id
-
-# ================= ЛОГИРОВАНИЕ =================
-
-async def log_action(text):
-    logger.info(f"ACTION: {text}")
-    if not shutdown_flag:
-        try:
-            await bot.send_message(SUPER_ADMIN, f"📜 <b>ЛОГ</b>\n\n{text}")
-        except:
-            pass
-
-def log_user_action(user_id: int, action: str, details: str = ""):
-    logger.info(f"USER {user_id}: {action} {details}")
-
-async def log_admin_action(admin_id: int, action: str, target_id: int = None, details: str = ""):
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute(
-                "INSERT INTO admin_actions (admin_id, action, target_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
-                (admin_id, action, target_id, details, datetime.utcnow().isoformat())
-            )
-            await db.commit()
-        logger.info(f"ADMIN ACTION: {admin_id} - {action} - {target_id} - {details}")
-    except Exception as e:
-        logger.error(f"Error logging admin action: {e}")
+def generate_captcha() -> tuple:
+    """Генерирует простую математическую капчу"""
+    a = random.randint(1, 20)
+    b = random.randint(1, 20)
+    operations = ['+', '-', '*']
+    op = random.choice(operations)
+    
+    if op == '+':
+        answer = a + b
+        question = f"{a} + {b}"
+    elif op == '-':
+        answer = a - b
+        question = f"{a} - {b}"
+    else:
+        a = random.randint(1, 10)
+        b = random.randint(1, 10)
+        answer = a * b
+        question = f"{a} × {b}"
+    
+    return question, str(answer)
 
 # ================= ИНИЦИАЛИЗАЦИЯ БД =================
 
@@ -654,6 +347,21 @@ async def load_blacklist_to_cache():
     except Exception as e:
         logger.error(f"Ошибка загрузки черного списка: {e}")
 
+async def load_faq_to_cache():
+    """Загружает FAQ в кэш"""
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT keywords, answer FROM faq")
+            faqs = await cursor.fetchall()
+            faq_cache.clear()
+            for keywords, answer in faqs:
+                for keyword in keywords.split(','):
+                    keyword = keyword.strip().lower()
+                    faq_cache[keyword] = answer
+        logger.info(f"Загружено {len(faqs)} FAQ записей")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки FAQ: {e}")
+
 async def init_db():
     async with db_pool.acquire() as db:
         await db.execute("""
@@ -664,7 +372,8 @@ async def init_db():
             last_message TEXT,
             username TEXT,
             first_name TEXT,
-            maintenance_exception INTEGER DEFAULT 0
+            maintenance_exception INTEGER DEFAULT 0,
+            captcha_passed INTEGER DEFAULT 0
         )
         """)
         
@@ -683,12 +392,18 @@ async def init_db():
             auto_posted INTEGER DEFAULT 0,
             has_links INTEGER DEFAULT 0,
             insult_count INTEGER DEFAULT 0,
-            skipped INTEGER DEFAULT 0
+            skipped INTEGER DEFAULT 0,
+            poll_data TEXT
         )
         """)
         
         try:
             await db.execute("ALTER TABLE messages ADD COLUMN notified_long INTEGER DEFAULT 0")
+        except:
+            pass
+        
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN poll_data TEXT")
         except:
             pass
         
@@ -740,7 +455,6 @@ async def init_db():
         )
         """)
         
-        # Новая таблица для хранения состояний ответов
         await db.execute("""
         CREATE TABLE IF NOT EXISTS reply_states(
             admin_id INTEGER PRIMARY KEY,
@@ -748,6 +462,19 @@ async def init_db():
             msg_id INTEGER,
             reply_type TEXT,
             created_at TEXT
+        )
+        """)
+        
+        # Таблица для FAQ
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS faq(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            keywords TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT,
+            updated_at TEXT
         )
         """)
         
@@ -763,11 +490,166 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO settings VALUES('post_counter','0')")
         await db.execute("INSERT OR IGNORE INTO settings VALUES('post_style','1')")
         await db.execute("INSERT OR IGNORE INTO settings VALUES('night_mode','0')")
-        await db.execute("INSERT OR IGNORE INTO settings VALUES('auto_mode','0')")  # Новый флаг
+        await db.execute("INSERT OR IGNORE INTO settings VALUES('auto_mode','0')")
         await db.execute("INSERT OR IGNORE INTO settings VALUES('maintenance','0')")
         await db.commit()
     
     await load_blacklist_to_cache()
+    await load_faq_to_cache()
+    
+    # Добавляем базовые FAQ если пусто
+    async with db_pool.acquire() as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM faq")
+        count = (await cursor.fetchone())[0]
+        
+        if count == 0:
+            default_faq = [
+                ("Как отправить сообщение?", "Просто напишите текст, фото или видео в этот чат. Сообщение будет опубликовано анонимно после проверки модератором.", "отправить,сообщение,написать,пост"),
+                ("Сколько ждать публикацию?", "Обычно сообщения проверяются в течение 24 часов. Фото и видео всегда проходят ручную модерацию.", "ждать,публикация,долго,скоро,когда"),
+                ("Почему отклонили сообщение?", "Возможные причины: наличие ссылок, сильная травля, реклама, спам или аморальный контент.", "отклонили,почему,отказ,не опубликовали"),
+                ("Какие правила?", "Запрещены: ссылки на сторонние ресурсы, сильная травля, реклама, спам. Фото и видео проходят ручную модерацию.", "правила,запрещено,нельзя,можно"),
+                ("Как создать опрос?", "Нажмите кнопку '📊 Создать опрос' в меню. Опросы проходят модерацию и публикуются анонимно.", "опрос,создать,голосование"),
+            ]
+            
+            for question, answer, keywords in default_faq:
+                await db.execute(
+                    "INSERT INTO faq (question, answer, keywords, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (question, answer, keywords, SUPER_ADMIN, datetime.utcnow().isoformat())
+                )
+            
+            await db.commit()
+            logger.info("Добавлены базовые FAQ")
+
+## ================= ВОДЯНОЙ ЗНАК =================
+
+async def add_watermark_to_photo(photo_file_id: str) -> str:
+    """Накладывает водяной знак на фото"""
+    try:
+        file = await bot.get_file(photo_file_id)
+        photo_bytes = await bot.download_file(file.file_path)
+
+        img = Image.open(photo_bytes).convert("RGBA")
+        width, height = img.size
+
+        txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt_layer)
+
+        text = "@podslu10"
+        font_size = max(16, int(width * 0.04))
+        
+        font = None
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        fill_color = (0, 0, 0, 0)
+
+        positions_x = [int(width * 0.12), int(width * 0.5), int(width * 0.88)]
+        positions_y = []
+        for i in range(5):
+            y = int(height * (0.1 + i * 0.2))
+            positions_y.append(y)
+
+        for col, x in enumerate(positions_x):
+            for row, y in enumerate(positions_y):
+                offset_x = int(text_width * 0.2) * (hash(f"{col}{row}") % 3 - 1)
+                offset_y = int(text_height * 0.2) * (hash(f"{col}{row}") % 3 - 1)
+                
+                final_x = x + offset_x
+                final_y = y + offset_y
+                
+                draw_x = final_x - text_width // 2
+                draw_y = final_y - text_height // 2
+                
+                draw.text((draw_x, draw_y), text, font=font, fill=fill_color)
+
+        center_watermark_path = "watermark_center.png"
+        
+        if os.path.exists(center_watermark_path):
+            try:
+                center_img = Image.open(center_watermark_path).convert("RGBA")
+                c_width, c_height = center_img.size
+                target_size = int(width * 0.4)
+                ratio = min(target_size / c_width, target_size / c_height)
+                new_size = (int(c_width * ratio), int(c_height * ratio))
+                center_img = center_img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                center_array = center_img.getdata()
+                new_center_array = []
+                for item in center_array:
+                    if item[3] > 0:
+                        new_center_array.append((item[0], item[1], item[2], 155))
+                    else:
+                        new_center_array.append(item)
+                
+                center_img.putdata(new_center_array)
+                
+                center_x = (width - new_size[0]) // 2
+                center_y = (height - new_size[1]) // 2
+                
+                center_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+                center_layer.paste(center_img, (center_x, center_y), center_img)
+                
+                combined_layer = Image.alpha_composite(txt_layer, center_layer)
+            except Exception as e:
+                logger.error(f"Error adding center watermark: {e}")
+                combined_layer = txt_layer
+        else:
+            combined_layer = txt_layer
+
+        watermarked = Image.alpha_composite(img, combined_layer).convert("RGB")
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
+            temp_path = tmp_file.name
+            watermarked.save(temp_path, format="JPEG", quality=95)
+
+        msg = await bot.send_photo(
+            chat_id=SUPER_ADMIN,
+            photo=FSInputFile(temp_path)
+        )
+        
+        new_file_id = msg.photo[-1].file_id
+        os.unlink(temp_path)
+        
+        logger.info(f"Watermark added successfully")
+        return new_file_id
+
+    except Exception as e:
+        logger.error(f"Watermark error: {e}")
+        return photo_file_id
+
+# ================= ЛОГИРОВАНИЕ =================
+
+async def log_action(text):
+    logger.info(f"ACTION: {text}")
+    if not shutdown_flag:
+        try:
+            await bot.send_message(SUPER_ADMIN, f"📜 <b>ЛОГ</b>\n\n{text}")
+        except:
+            pass
+
+def log_user_action(user_id: int, action: str, details: str = ""):
+    logger.info(f"USER {user_id}: {action} {details}")
+
+async def log_admin_action(admin_id: int, action: str, target_id: int = None, details: str = ""):
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "INSERT INTO admin_actions (admin_id, action, target_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
+                (admin_id, action, target_id, details, datetime.utcnow().isoformat())
+            )
+            await db.commit()
+        logger.info(f"ADMIN ACTION: {admin_id} - {action} - {target_id} - {details}")
+    except Exception as e:
+        logger.error(f"Error logging admin action: {e}")
 
 # ================= АВТОМАТИЧЕСКАЯ ПУБЛИКАЦИЯ =================
 
@@ -787,7 +669,6 @@ async def notify_admins_about_auto_post(msg_id: int, user_id: int, media_type: s
         f"Тип: {media_type}"
     )
     
-    # Для обычных админов НЕ показываем ID пользователя
     for admin in ADMINS:
         try:
             if admin == SUPER_ADMIN:
@@ -799,16 +680,15 @@ async def notify_admins_about_auto_post(msg_id: int, user_id: int, media_type: s
             pass
 
 async def post_next_message():
-    """Публикует следующее сообщение из очереди (с блокировкой)"""
-    async with publish_lock:  # Блокировка для предотвращения дублей
+    """Публикует следующее сообщение из очереди"""
+    async with publish_lock:
         try:
             async with db_pool.acquire() as db:
-                # Используем транзакцию
                 await db.execute("BEGIN TRANSACTION")
                 
                 try:
                     cursor = await db.execute("""
-                        SELECT id, user_id, text, media_type, media_file_id, has_links, insult_count
+                        SELECT id, user_id, text, media_type, media_file_id, has_links, insult_count, poll_data
                         FROM messages 
                         WHERE status='pending' AND reviewer IS NULL AND skipped=0
                         ORDER BY created_at ASC 
@@ -820,21 +700,21 @@ async def post_next_message():
                         await db.execute("ROLLBACK")
                         return
                     
-                    msg_id, user_id, text, media_type, media_file_id, has_links, insult_count = message
+                    msg_id, user_id, text, media_type, media_file_id, has_links, insult_count, poll_data = message
                     has_immoral = has_immoral_content(text) if text else False
                     
                     can_auto_post = (
                         media_type is None and
                         not has_links and
                         not has_immoral and
-                        insult_count < INSULT_THRESHOLD
+                        insult_count < INSULT_THRESHOLD and
+                        not poll_data
                     )
                     
                     if not can_auto_post:
                         await db.execute("ROLLBACK")
                         return
                     
-                    # Помечаем как "в обработке" чтобы другие потоки не взяли
                     await db.execute("""
                         UPDATE messages 
                         SET status='processing', reviewed_at=? 
@@ -845,19 +725,17 @@ async def post_next_message():
                     counter = int((await cursor.fetchone())[0]) + 1
                     await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
                     
-                    await db.commit()  # Фиксируем изменения в БД
+                    await db.commit()
                     
                 except Exception as e:
                     await db.execute("ROLLBACK")
                     logger.error(f"DB error in post_next_message: {e}")
                     return
             
-            # Получаем стиль
             async with db_pool.acquire() as db:
                 cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
                 style = (await cursor.fetchone())[0]
             
-            # Экранируем текст и формируем сообщение
             escaped_text = escape_html(text) if text else ""
             
             if style == "1":
@@ -870,7 +748,6 @@ async def post_next_message():
                 header = f"📌 <b>Анонимное сообщение</b>\n\n"
                 footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
             
-            # Отправляем в канал
             try:
                 await bot.send_message(
                     CHANNEL_ID,
@@ -880,7 +757,6 @@ async def post_next_message():
                 )
             except Exception as e:
                 logger.error(f"Error sending to channel: {e}")
-                # Откатываем статус если не удалось отправить
                 async with db_pool.acquire() as db:
                     await db.execute(
                         "UPDATE messages SET status='pending', reviewed_at=NULL WHERE id=?",
@@ -889,7 +765,6 @@ async def post_next_message():
                     await db.commit()
                 return
             
-            # Обновляем статус на approved
             async with db_pool.acquire() as db:
                 await db.execute("""
                     UPDATE messages 
@@ -898,7 +773,6 @@ async def post_next_message():
                 """, (msg_id,))
                 await db.commit()
             
-            # Определяем режим для уведомления
             hour = (datetime.utcnow() + timedelta(hours=3)).hour
             mode = 'night' if hour < 8 else 'auto'
             
@@ -915,17 +789,13 @@ async def auto_post_messages():
         try:
             current_time = time.time()
             
-            # Проверяем, можно ли публиковать сейчас
             if can_auto_post_now() and not maintenance_mode:
-                # Получаем текущий интервал
                 _, interval = get_current_mode_and_interval()
                 
-                # Проверяем, прошло ли достаточно времени
                 if current_time - last_post_time >= interval * 60:
                     await post_next_message()
                     last_post_time = current_time
             
-            # Проверяем каждые 30 секунд
             for _ in range(30):
                 if shutdown_flag:
                     break
@@ -957,10 +827,8 @@ async def check_long_pending_messages():
                 for msg in old_messages:
                     msg_id, user_id, media_type, short_text, created_at = msg
                     
-                    # Очищаем текст от HTML для безопасного отображения
                     clean_short_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
                     
-                    # Для SUPER_ADMIN показываем ID
                     for admin in ADMINS:
                         if admin == SUPER_ADMIN:
                             text = (
@@ -1067,7 +935,8 @@ async def start(message: Message, state: FSMContext):
             [KeyboardButton(text="🎨 Сменить стиль")],
             [KeyboardButton(text="📊 Статистика")],
             [KeyboardButton(text="👥 Управление пользователями")],
-            [KeyboardButton(text="📨 Ожидающие проверки")]
+            [KeyboardButton(text="📨 Ожидающие проверки")],
+            [KeyboardButton(text="🌐 Веб-панель")]
         ]
         
         if message.from_user.id == SUPER_ADMIN:
@@ -1080,6 +949,7 @@ async def start(message: Message, state: FSMContext):
             keyboard_buttons.append([KeyboardButton(text=f"🛠 Техработы ({maint_status})")])
             keyboard_buttons.append([KeyboardButton(text="👥 Управление исключениями")])
             keyboard_buttons.append([KeyboardButton(text="📝 Черный список слов")])
+            keyboard_buttons.append([KeyboardButton(text="❓ Управление FAQ")])
         
         keyboard_buttons.append([KeyboardButton(text="⏳ Временный мут")])
         keyboard_buttons.append([KeyboardButton(text="📋 История действий")])
@@ -1098,15 +968,25 @@ async def start(message: Message, state: FSMContext):
         keyboard=[
             [KeyboardButton(text="ℹ Информация")],
             [KeyboardButton(text="❓ Помощь")],
-            # [KeyboardButton(text="📩 Написать админу")]  # Функция отключена до починки
+            [KeyboardButton(text="❔ FAQ")],
+            [KeyboardButton(text="📊 Создать опрос")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Отправьте сообщение, фото или видео..."
     )
 
     await message.answer(
-        "👋 <b>Подслушано</b>\n\n"
-        "Отправьте сообщение, фото или видео - они будут опубликованы анонимно после проверки.\n",
+        "👋 Добро пожаловать в «Подслушано»!\n\n"
+        "📢 Здесь ты можешь:\n"
+        "• Отправить анонимное сообщение\n"
+        "• Поделиться историей\n"
+        "• Задать вопрос сообществу\n"
+        "• Создать анонимный опрос\n"
+        "• Задать вопрос в FAQ\n\n"
+        "⏳ Модерация: до 24 часов\n"
+        "🚫 Запрещены: сильная травля, спам, реклама, ссылки\n"
+        "📸 Можно: фото и видео\n\n"
+        "Используй кнопки меню для навигации 👇",
         reply_markup=keyboard
     )
 
@@ -1120,8 +1000,8 @@ async def info_text(message: Message):
         "Можно отправлять:\n"
         "• Текстовые сообщения\n"
         "• Фотографии\n"
-        "• Видео\n\n"
-        
+        "• Видео\n"
+        "• Опросы\n\n"
         "Фото и видео всегда проверяются модераторами."
     )
 
@@ -1134,223 +1014,513 @@ async def help_text(message: Message):
         "Максимальный размер видео: 50 МБ\n\n"
         "Запрещено:\n"
         "• Ссылки на сторонние ресурсы\n"
-        "• Очень сильная травля\n"
+        "• Сильная травля\n"
         "• Реклама\n\n"
         "Фото и видео всегда проходят ручную проверку."
     )
 
-# ================= АДМИНСКИЕ КНОПКИ =================
-
-@dp.message(F.text == "🎨 Сменить стиль")
-async def admin_style(message: Message):
-    if message.from_user.id not in ADMINS:
-        return
-    
+@dp.message(F.text == "❔ FAQ")
+async def faq_button(message: Message):
+    """Показывает список FAQ или запускает поиск"""
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
-            current_style = (await cursor.fetchone())[0]
+            cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
+            faqs = await cursor.fetchall()
     except Exception as e:
-        logger.error(f"DB error in admin_style: {e}")
-        current_style = "1"
-    
-    styles = {"1": "Обычный", "2": "С рамкой", "3": "Минимализм"}
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"{'✅ ' if current_style=='1' else ''}Стиль 1 - Обычный", 
-            callback_data="set_style_1"
-        )],
-        [InlineKeyboardButton(
-            text=f"{'✅ ' if current_style=='2' else ''}Стиль 2 - С рамкой", 
-            callback_data="set_style_2"
-        )],
-        [InlineKeyboardButton(
-            text=f"{'✅ ' if current_style=='3' else ''}Стиль 3 - Минимализм", 
-            callback_data="set_style_3"
-        )]
-    ])
-    
-    await message.answer(
-        f"🎨 <b>Текущий стиль: {styles[current_style]}</b>\n\nВыберите новый стиль:",
-        reply_markup=keyboard
-    )
-
-@dp.message(F.text == "📊 Статистика")
-async def admin_stats(message: Message):
-    if message.from_user.id not in ADMINS:
+        logger.error(f"Error loading FAQ: {e}")
+        await message.answer("❌ Ошибка загрузки FAQ")
         return
     
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute("""
-                SELECT 
-                    (SELECT COUNT(*) FROM users) as total_users,
-                    (SELECT COUNT(*) FROM users WHERE banned=1) as banned_users,
-                    (SELECT COUNT(*) FROM users WHERE mute_until > datetime('now')) as muted_users,
-                    (SELECT COUNT(*) FROM users WHERE maintenance_exception=1) as exception_users,
-                    (SELECT COUNT(*) FROM messages) as total_messages,
-                    (SELECT COUNT(*) FROM messages WHERE status='pending') as pending_messages,
-                    (SELECT COUNT(*) FROM messages WHERE media_type IS NOT NULL) as media_messages,
-                    (SELECT COUNT(*) FROM messages WHERE auto_posted=1) as auto_posted,
-                    (SELECT COUNT(*) FROM messages WHERE has_links=1) as with_links,
-                    (SELECT COUNT(*) FROM messages WHERE skipped=1) as skipped_messages,
-                    (SELECT COUNT(*) FROM messages WHERE insult_count >= ?) as heavy_insults,
-                    (SELECT value FROM settings WHERE key='post_counter') as post_counter,
-                    (SELECT COUNT(*) FROM blacklist) as blacklist_count,
-                    (SELECT COUNT(*) FROM admin_actions WHERE date(created_at) = date('now')) as today_actions,
-                    (SELECT COUNT(*) FROM admin_messages WHERE status='new') as new_messages
-            """, (INSULT_THRESHOLD,))
-            
-            result = await cursor.fetchone()
-            total_users, banned_users, muted_users, exception_users, total_messages, pending_messages, media_messages, auto_posted, with_links, skipped_messages, heavy_insults, post_counter, blacklist_count, today_actions, new_messages = result
-    except Exception as e:
-        logger.error(f"DB error in admin_stats: {e}")
-        await message.answer("❌ Ошибка получения статистики")
-        return
-    
-    mode, interval = get_current_mode_and_interval()
-    if mode == 'night':
-        mode_text = f"🌙 Ночной {'✅' if night_mode_enabled else '❌'}"
-    elif mode == 'night_disabled':
-        mode_text = "🌙 Ночной ❌ (выключен)"
-    elif mode == 'auto':
-        mode_text = f"☀️ Автоматический {'✅' if auto_mode_enabled else '❌'}"
-    else:
-        mode_text = "☀️ Автоматический ❌ (выключен)"
-    
-    stats_text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"👥 Всего пользователей: {total_users}\n"
-        f"⛔ Забанено: {banned_users}\n"
-        f"🔇 В муте: {muted_users}\n"
-        f"⭐ В исключении: {exception_users}\n"
-        f"📨 Всего сообщений: {total_messages}\n"
-        f"   📝 Текстовых: {total_messages - media_messages}\n"
-        f"   🖼 С медиа: {media_messages}\n"
-        f"   🔗 Со ссылками: {with_links}\n"
-        f"   🤬 С матом: {heavy_insults}\n"
-        f"   🤖 Авто-пост: {auto_posted}\n"
-        f"   ⏭ Пропущено: {skipped_messages}\n"
-        f"⏳ Ожидают проверки: {pending_messages}\n"
-        f"📝 Опубликовано постов: {post_counter}\n"
-        f"📚 Черный список: {blacklist_count} слов\n"
-        f"📋 Действий сегодня: {today_actions}\n"
-        f"📩 Новых личных сообщений: {new_messages}\n"
-        f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}\n"
-        f"☀️ Авто-режим: {'✅' if auto_mode_enabled else '❌'}\n"
-        f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}\n"
-        f"⏱ Текущий режим: {mode_text} (интервал {interval} мин)"
-    )
-    
-    await message.answer(stats_text)
-
-@dp.message(F.text == "👥 Управление пользователями")
-async def admin_users(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
+    if not faqs:
+        await message.answer("❔ FAQ пока пуст")
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="find_user")],
-        [InlineKeyboardButton(text="📋 Список забаненных", callback_data="list_banned")],
-        [InlineKeyboardButton(text="📋 Список замученных", callback_data="list_muted")]
+        [InlineKeyboardButton(text=question, callback_data=f"faq_{faq_id}")]
+        for faq_id, question in faqs[:10]
     ])
     
+    if len(faqs) > 10:
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(text="🔍 Поиск по FAQ", callback_data="faq_search")
+        ])
+    
     await message.answer(
-        "👥 <b>Управление пользователями</b>\n\n"
-        "Выберите действие:",
+        "❔ <b>Часто задаваемые вопросы</b>\n\n"
+        "Выберите вопрос или используйте поиск:",
         reply_markup=keyboard
     )
 
-@dp.message(F.text == "📨 Ожидающие проверки")
-async def admin_pending_messages(message: Message):
-    if message.from_user.id not in ADMINS:
+@dp.callback_query(F.data.startswith("faq_"))
+async def faq_answer(callback: CallbackQuery):
+    """Показывает ответ на FAQ"""
+    if callback.data == "faq_search":
+        await callback.message.answer(
+            "🔍 Отправьте ключевое слово для поиска в FAQ.\n"
+            "Например: правила, опрос, публикация"
+        )
+        await callback.answer()
         return
+    
+    faq_id = int(callback.data.split("_")[1])
     
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
-                "SELECT COUNT(*) FROM messages WHERE status='pending' AND skipped=0"
+                "SELECT question, answer FROM faq WHERE id=?",
+                (faq_id,)
             )
-            total_pending = (await cursor.fetchone())[0]
+            result = await cursor.fetchone()
             
-            cursor = await db.execute("""
-                SELECT id, user_id, media_type, 
-                       substr(text, 1, 50) as short_text, 
-                       created_at, has_links, insult_count
-                FROM messages 
-                WHERE status='pending' AND skipped=0
-                ORDER BY created_at DESC 
-                LIMIT 10
-            """)
-            pending_messages = await cursor.fetchall()
+            if result:
+                question, answer = result
+                await callback.message.answer(
+                    f"❔ <b>{question}</b>\n\n{answer}"
+                )
+            else:
+                await callback.answer("Вопрос не найден", show_alert=True)
     except Exception as e:
-        logger.error(f"DB error in admin_pending_messages: {e}")
-        await message.answer("❌ Ошибка получения списка сообщений")
+        logger.error(f"Error getting FAQ answer: {e}")
+        await callback.answer("Ошибка загрузки ответа", show_alert=True)
+    
+    await callback.answer()
+
+@dp.message(F.text)
+async def faq_search(message: Message, state: FSMContext):
+    """Поиск по FAQ по ключевым словам"""
+    current_state = await state.get_state()
+    
+    # Проверяем, не в режиме ли ответа на FAQ
+    if current_state == "AdminStates:waiting_for_faq_question":
         return
     
-    if not pending_messages:
-        await message.answer("📨 Нет сообщений, ожидающих проверки")
+    # Ищем совпадения в FAQ
+    search_text = message.text.lower()
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT question, answer, keywords FROM faq")
+            all_faqs = await cursor.fetchall()
+    except Exception as e:
+        return  # Если не FAQ, пропускаем
+    
+    # Простой поиск по ключевым словам
+    found = []
+    for question, answer, keywords in all_faqs:
+        keywords_list = keywords.split(',')
+        for keyword in keywords_list:
+            if keyword.strip() in search_text:
+                found.append((question, answer))
+                break
+    
+    if found:
+        # Показываем до 3 результатов
+        for question, answer in found[:3]:
+            await message.answer(f"❔ <b>{question}</b>\n\n{answer}")
+            await asyncio.sleep(0.2)
+    # Если не нашли - не отвечаем, пусть идет как обычное сообщение
+
+## ================= ВЕБ-ПАНЕЛЬ (Web App) =================
+
+@dp.message(F.text == "🌐 Веб-панель")
+async def open_web_panel(message: Message):
+    """Открывает Web App для администраторов"""
+    if message.from_user.id not in ADMINS:
         return
     
-    text = f"📨 Ожидают проверки: {total_pending}\n\n"
-    if total_pending > 10:
-        text += f"Показаны последние 10 из {total_pending}\n\n"
+    # Формируем URL с параметрами для авторизации
+    user_id = message.from_user.id
+    username = message.from_user.username or "unknown"
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    web_app_url = f"{WEB_APP_URL}?user_id={user_id}&username={username}"
     
-    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count in pending_messages:
-        try:
-            msg_date = datetime.fromisoformat(created_at)
-            date_str = msg_date.strftime('%d.%m %H:%M')
-        except:
-            date_str = created_at[:16] if created_at else "неизвестно"
-        
-        if media_type == "photo":
-            emoji = "📸"
-            content_type = "Фото"
-        elif media_type == "video":
-            emoji = "🎥"
-            content_type = "Видео"
-        else:
-            emoji = "📝"
-            content_type = "Текст"
-        
-        warnings = []
-        if has_links:
-            warnings.append("🔗")
-        if insult_count >= INSULT_THRESHOLD:
-            warnings.append(f"🤬{insult_count}")
-        
-        warning_str = f" {' '.join(warnings)}" if warnings else ""
-        
-        # Очищаем текст от HTML-тегов для безопасного отображения
-        clean_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
-        display_text = clean_text.replace('\n', ' ').strip() if clean_text else "без текста"
-        if len(display_text) > 30:
-            display_text = display_text[:30] + "..."
-        
-        # Для обычных админов НЕ показываем user_id
-        if message.from_user.id == SUPER_ADMIN:
-            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
-            text += f"👤 ID: {user_id}\n"
-        else:
-            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
-        
-        text += f"💬 {display_text}\n\n"
-        
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(
-                text=f"🔍 Рассмотреть #{msg_id} ({content_type})",
-                callback_data=f"review_{msg_id}"
-            )
-        ])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔧 Открыть панель управления",
+            web_app=WebAppInfo(url=web_app_url)
+        )]
+    ])
     
-    keyboard.inline_keyboard.append([
-        InlineKeyboardButton(text="🔄 Обновить список", callback_data="refresh_pending")
+    await message.answer(
+        "🌐 <b>Веб-панель администратора</b>\n\n"
+        "Нажмите кнопку ниже для открытия панели управления.\n\n"
+        "📊 Статистика\n"
+        "📨 Модерация сообщений\n"
+        "👥 Управление пользователями\n"
+        "⚙️ Настройки бота",
+        reply_markup=keyboard
+    )
+
+# ================= УПРАВЛЕНИЕ FAQ (только супер-админ) =================
+
+@dp.message(F.text == "❓ Управление FAQ")
+async def manage_faq(message: Message):
+    """Управление FAQ (только супер-админ)"""
+    if message.from_user.id != SUPER_ADMIN:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT id, question, keywords FROM faq ORDER BY id")
+            faqs = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Error loading FAQ: {e}")
+        await message.answer("❌ Ошибка загрузки FAQ")
+        return
+    
+    text = "❓ <b>Управление FAQ</b>\n\n"
+    if faqs:
+        for faq_id, question, keywords in faqs[:20]:
+            text += f"#{faq_id} {question}\n"
+            text += f"Ключевые слова: {keywords}\n\n"
+    else:
+        text += "FAQ пуст\n\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить вопрос", callback_data="faq_add")],
+        [InlineKeyboardButton(text="➖ Удалить вопрос", callback_data="faq_remove")],
+        [InlineKeyboardButton(text="📋 Показать все", callback_data="faq_list")],
+        [InlineKeyboardButton(text="🔄 Обновить кэш", callback_data="faq_refresh")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="faq_close")]
     ])
     
     await message.answer(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "faq_add")
+async def faq_add_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    await state.set_state(AdminStates.waiting_for_faq_add)
+    await callback.message.answer(
+        "➕ <b>Добавление FAQ</b>\n\n"
+        "Отправьте данные в формате:\n\n"
+        "<b>Вопрос</b>\n"
+        "<b>Ответ</b>\n"
+        "<b>Ключевые слова</b> (через запятую)\n\n"
+        "Пример:\n"
+        "Как отправить фото?\n"
+        "Отправьте фото в этот чат, оно пройдет модерацию.\n"
+        "фото,отправить,изображение\n\n"
+        "Или /cancel для отмены"
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_faq_add)
+async def process_faq_add(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление отменено")
+        return
+    
+    try:
+        lines = message.text.strip().split('\n')
+        if len(lines) < 3:
+            await message.answer("❌ Неверный формат. Нужно минимум 3 строки: вопрос, ответ, ключевые слова")
+            return
+        
+        question = lines[0].strip()
+        answer = lines[1].strip()
+        keywords = lines[2].strip().lower()
+        
+        if not question or not answer or not keywords:
+            await message.answer("❌ Все поля должны быть заполнены")
+            return
+        
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "INSERT INTO faq (question, answer, keywords, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                (question, answer, keywords, message.from_user.id, datetime.utcnow().isoformat())
+            )
+            await db.commit()
+        
+        # Обновляем кэш
+        faq_cache.clear()
+        await load_faq_to_cache()
+        
+        await message.answer(
+            f"✅ FAQ добавлен:\n\n"
+            f"<b>Вопрос:</b> {question}\n"
+            f"<b>Ответ:</b> {answer}\n"
+            f"<b>Ключевые слова:</b> {keywords}"
+        )
+        await log_admin_action(message.from_user.id, "faq_add", details=question)
+        
+    except Exception as e:
+        logger.error(f"Error adding FAQ: {e}")
+        await message.answer("❌ Ошибка при добавлении FAQ")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "faq_remove")
+async def faq_remove_prompt(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
+            faqs = await cursor.fetchall()
+    except:
+        await callback.answer("Ошибка загрузки")
+        return
+    
+    if not faqs:
+        await callback.message.answer("FAQ пуст")
+        await callback.answer()
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"❌ {question}", callback_data=f"faq_delete_{faq_id}")]
+        for faq_id, question in faqs[:20]
+    ])
+    
+    await callback.message.answer("Выберите вопрос для удаления:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("faq_delete_"))
+async def faq_delete(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    
+    faq_id = int(callback.data.split("_")[2])
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute("DELETE FROM faq WHERE id=?", (faq_id,))
+            await db.commit()
+        
+        faq_cache.clear()
+        await load_faq_to_cache()
+        
+        await callback.message.edit_text(f"✅ FAQ #{faq_id} удален")
+        await log_admin_action(callback.from_user.id, "faq_remove", details=f"id={faq_id}")
+    except Exception as e:
+        logger.error(f"Error deleting FAQ: {e}")
+        await callback.answer("Ошибка удаления")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "faq_list")
+async def faq_list(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT id, question, answer, keywords FROM faq ORDER BY id")
+            faqs = await cursor.fetchall()
+    except:
+        await callback.answer("Ошибка загрузки")
+        return
+    
+    if not faqs:
+        await callback.message.answer("FAQ пуст")
+        await callback.answer()
+        return
+    
+    text = "❓ <b>Все вопросы FAQ:</b>\n\n"
+    for faq_id, question, answer, keywords in faqs:
+        text += f"<b>#{faq_id}</b> {question}\n"
+        text += f"Ответ: {answer[:100]}...\n"
+        text += f"Ключевые слова: {keywords}\n\n"
+        
+        if len(text) > 3000:
+            await callback.message.answer(text)
+            text = ""
+    
+    if text:
+        await callback.message.answer(text)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "faq_refresh")
+async def faq_refresh(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        return
+    
+    faq_cache.clear()
+    await load_faq_to_cache()
+    
+    await callback.message.edit_text("🔄 Кэш FAQ обновлен")
+    await callback.answer()
+
+@dp.callback_query(F.data == "faq_close")
+async def faq_close(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
+
+# ================= ОПРОСЫ =================
+
+@dp.message(F.text == "📊 Создать опрос")
+async def create_poll_start(message: Message, state: FSMContext):
+    """Начало создания опроса"""
+    user_id = message.from_user.id
+    
+    if user_id in ADMINS:
+        return
+    
+    # Проверяем кулдаун
+    if user_id in user_message_cooldown:
+        remaining = user_message_cooldown[user_id]
+        minutes = remaining // 60
+        seconds = remaining % 60
+        await message.answer(f"⏳ Подождите {minutes} мин {seconds} сек перед созданием опроса.")
+        return
+    
+    await state.set_state(AdminStates.waiting_for_poll_question)
+    await message.answer(
+        "📊 <b>Создание анонимного опроса</b>\n\n"
+        "Шаг 1/2: Отправьте вопрос для опроса.\n"
+        "Например: «Какой ваш любимый цвет?»\n\n"
+        "Или /cancel для отмены"
+    )
+
+@dp.message(AdminStates.waiting_for_poll_question)
+async def poll_question(message: Message, state: FSMContext):
+    """Получение вопроса опроса"""
+    if message.from_user.id in ADMINS:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Создание опроса отменено")
+        return
+    
+    question = message.text.strip()
+    
+    if len(question) > 255:
+        await message.answer("❌ Вопрос слишком длинный. Максимум 255 символов.")
+        return
+    
+    if len(question) < 5:
+        await message.answer("❌ Вопрос слишком короткий. Минимум 5 символов.")
+        return
+    
+    await state.update_data(poll_question=question)
+    await state.set_state(AdminStates.waiting_for_poll_options)
+    
+    await message.answer(
+        "📊 Шаг 2/2: Отправьте варианты ответов.\n\n"
+        "Каждый вариант с новой строки (от 2 до 10 вариантов).\n"
+        "Например:\n"
+        "Красный\n"
+        "Синий\n"
+        "Зеленый\n"
+        "Другой\n\n"
+        "Или /cancel для отмены"
+    )
+
+@dp.message(AdminStates.waiting_for_poll_options)
+async def poll_options(message: Message, state: FSMContext):
+    """Получение вариантов ответа и создание опроса"""
+    if message.from_user.id in ADMINS:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Создание опроса отменено")
+        return
+    
+    options_text = message.text.strip()
+    options = [opt.strip() for opt in options_text.split('\n') if opt.strip()]
+    
+    if len(options) < 2:
+        await message.answer("❌ Минимум 2 варианта ответа.")
+        return
+    
+    if len(options) > 10:
+        await message.answer("❌ Максимум 10 вариантов ответа.")
+        return
+    
+    for opt in options:
+        if len(opt) > 100:
+            await message.answer(f"❌ Вариант «{opt[:50]}...» слишком длинный. Максимум 100 символов.")
+            return
+    
+    data = await state.get_data()
+    question = data.get("poll_question")
+    
+    # Сохраняем опрос в БД
+    poll_data = json.dumps({
+        "question": question,
+        "options": options,
+        "allows_multiple_answers": True,
+        "is_anonymous": True
+    })
+    
+    now = datetime.utcnow()
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute("""
+                INSERT INTO users (user_id, username, first_name, last_message) 
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET 
+                    username=excluded.username,
+                    first_name=excluded.first_name,
+                    last_message=excluded.last_message
+            """, (message.from_user.id, message.from_user.username, message.from_user.first_name, now.isoformat()))
+            
+            cursor = await db.execute("""
+                INSERT INTO messages 
+                (user_id, text, media_type, created_at, poll_data) 
+                VALUES (?, ?, ?, ?, ?) RETURNING id
+            """, (message.from_user.id, question, "poll", now.isoformat(), poll_data))
+            
+            row = await cursor.fetchone()
+            msg_id = row[0]
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Error saving poll: {e}")
+        await message.answer("❌ Ошибка при сохранении опроса")
+        await state.clear()
+        return
+    
+    user_cache[message.from_user.id] = {'banned': False, 'mute_until': None, 'last_message': now}
+    user_message_cooldown[message.from_user.id] = 30
+    pending_cache.clear()
+    
+    await message.answer("✅ Опрос отправлен на модерацию!")
+    
+    # Отправляем админам
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Перейти к опросу", callback_data=f"review_{msg_id}")]
+    ])
+    
+    options_preview = "\n".join([f"• {opt}" for opt in options])
+    
+    for admin in ADMINS:
+        try:
+            if admin == SUPER_ADMIN:
+                await bot.send_message(
+                    admin,
+                    f"📊 <b>Новый опрос</b>\n\n"
+                    f"<b>Вопрос:</b> {escape_html(question)}\n\n"
+                    f"<b>Варианты:</b>\n{escape_html(options_preview)}\n\n"
+                    f"🆔 <code>{message.from_user.id}</code>\n"
+                    f"👤 @{message.from_user.username or 'нет'}",
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.send_message(
+                    admin,
+                    f"📊 <b>Новый опрос</b>\n\n"
+                    f"<b>Вопрос:</b> {escape_html(question)}\n\n"
+                    f"<b>Варианты:</b>\n{escape_html(options_preview)}",
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+        except Exception as e:
+            logger.error(f"Error sending poll to admin: {e}")
+    
+    await state.clear()
 
 @dp.message(F.text == "❌ Закрыть меню")
 async def close_menu(message: Message, state: FSMContext):
@@ -1733,7 +1903,8 @@ async def show_admin_history(message: Message):
             "blacklist_add": "📝➕", "blacklist_remove": "📝➖",
             "temporary_mute": "⏳", "reply": "💬",
             "approve_watermark": "✅➕",
-            "night_mode_toggle": "🌙", "auto_mode_toggle": "☀️"
+            "night_mode_toggle": "🌙", "auto_mode_toggle": "☀️",
+            "faq_add": "❓➕", "faq_remove": "❓➖"
         }.get(action, "📌")
         
         target_text = f" <code>{target_id}</code>" if target_id else ""
@@ -1783,7 +1954,6 @@ async def export_history(callback: CallbackQuery):
         
         text += f"{date_str};{admin_id};{action};{target_id or ''};{details or ''}\n"
     
-    import io
     file = io.BytesIO(text.encode('utf-8'))
     file.name = "admin_history.txt"
     
@@ -1794,251 +1964,173 @@ async def export_history(callback: CallbackQuery):
     
     await callback.answer()
 
-# ================= ПОИСК ПОЛЬЗОВАТЕЛЯ =================
+# ================= СТАТИСТИКА =================
 
-@dp.callback_query(F.data == "find_user")
-async def find_user_prompt(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMINS:
-        return
-    await state.set_state(AdminStates.waiting_for_user_search)
-    await callback.message.answer(
-        "🔍 Введите ID пользователя, username или имя для поиска:\n(или отправьте /cancel для отмены)"
-    )
-    await callback.answer()
-
-@dp.message(AdminStates.waiting_for_user_search)
-async def process_user_search(message: Message, state: FSMContext):
+@dp.message(F.text == "📊 Статистика")
+async def admin_stats(message: Message):
     if message.from_user.id not in ADMINS:
-        await state.clear()
         return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("❌ Поиск отменен")
-        return
-    
-    search = message.text.strip()
     
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute("""
-                SELECT user_id, username, first_name, banned, mute_until, maintenance_exception
-                FROM users 
-                WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ?
-                LIMIT 10
-            """, (f"%{search}%", f"%{search}%", f"%{search}%"))
-            users = await cursor.fetchall()
+                SELECT 
+                    (SELECT COUNT(*) FROM users) as total_users,
+                    (SELECT COUNT(*) FROM users WHERE banned=1) as banned_users,
+                    (SELECT COUNT(*) FROM users WHERE mute_until > datetime('now')) as muted_users,
+                    (SELECT COUNT(*) FROM users WHERE maintenance_exception=1) as exception_users,
+                    (SELECT COUNT(*) FROM users WHERE captcha_passed=1) as verified_users,
+                    (SELECT COUNT(*) FROM messages) as total_messages,
+                    (SELECT COUNT(*) FROM messages WHERE status='pending') as pending_messages,
+                    (SELECT COUNT(*) FROM messages WHERE media_type IS NOT NULL) as media_messages,
+                    (SELECT COUNT(*) FROM messages WHERE auto_posted=1) as auto_posted,
+                    (SELECT COUNT(*) FROM messages WHERE has_links=1) as with_links,
+                    (SELECT COUNT(*) FROM messages WHERE skipped=1) as skipped_messages,
+                    (SELECT COUNT(*) FROM messages WHERE insult_count >= ?) as heavy_insults,
+                    (SELECT value FROM settings WHERE key='post_counter') as post_counter,
+                    (SELECT COUNT(*) FROM blacklist) as blacklist_count,
+                    (SELECT COUNT(*) FROM admin_actions WHERE date(created_at) = date('now')) as today_actions,
+                    (SELECT COUNT(*) FROM admin_messages WHERE status='new') as new_messages,
+                    (SELECT COUNT(*) FROM faq) as faq_count
+            """, (INSULT_THRESHOLD,))
+            
+            result = await cursor.fetchone()
+            (total_users, banned_users, muted_users, exception_users, verified_users,
+             total_messages, pending_messages, media_messages, auto_posted, with_links,
+             skipped_messages, heavy_insults, post_counter, blacklist_count,
+             today_actions, new_messages, faq_count) = result
     except Exception as e:
-        logger.error(f"DB error in process_user_search: {e}")
-        await message.answer("❌ Ошибка поиска")
-        await state.clear()
+        logger.error(f"DB error in admin_stats: {e}")
+        await message.answer("❌ Ошибка получения статистики")
         return
     
-    if not users:
-        await message.answer("❌ Пользователи не найдены")
-        await state.clear()
+    mode, interval = get_current_mode_and_interval()
+    if mode == 'night':
+        mode_text = f"🌙 Ночной {'✅' if night_mode_enabled else '❌'}"
+    elif mode == 'night_disabled':
+        mode_text = "🌙 Ночной ❌ (выключен)"
+    elif mode == 'auto':
+        mode_text = f"☀️ Автоматический {'✅' if auto_mode_enabled else '❌'}"
+    else:
+        mode_text = "☀️ Автоматический ❌ (выключен)"
+    
+    stats_text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"   ✅ Прошли капчу: {verified_users}\n"
+        f"⛔ Забанено: {banned_users}\n"
+        f"🔇 В муте: {muted_users}\n"
+        f"⭐ В исключении: {exception_users}\n"
+        f"📨 Всего сообщений: {total_messages}\n"
+        f"   📝 Текстовых: {total_messages - media_messages}\n"
+        f"   🖼 С медиа: {media_messages}\n"
+        f"   🔗 Со ссылками: {with_links}\n"
+        f"   🤬 С матом: {heavy_insults}\n"
+        f"   🤖 Авто-пост: {auto_posted}\n"
+        f"   ⏭ Пропущено: {skipped_messages}\n"
+        f"⏳ Ожидают проверки: {pending_messages}\n"
+        f"📝 Опубликовано постов: {post_counter}\n"
+        f"📚 Черный список: {blacklist_count} слов\n"
+        f"❓ FAQ записей: {faq_count}\n"
+        f"📋 Действий сегодня: {today_actions}\n"
+        f"📩 Новых личных сообщений: {new_messages}\n"
+        f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}\n"
+        f"☀️ Авто-режим: {'✅' if auto_mode_enabled else '❌'}\n"
+        f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}\n"
+        f"⏱ Текущий режим: {mode_text} (интервал {interval} мин)"
+    )
+    
+    await message.answer(stats_text)
+
+# ================= СМЕНА СТИЛЯ =================
+
+@dp.message(F.text == "🎨 Сменить стиль")
+async def admin_style(message: Message):
+    if message.from_user.id not in ADMINS:
         return
     
-    for user in users:
-        user_id, username, first_name, banned, mute_until, maintenance_exception = user
-        status = []
-        if banned:
-            status.append("⛔ Забанен")
-        if maintenance_exception:
-            status.append("⭐ Исключение")
-        
-        if mute_until:
-            try:
-                mute_date = datetime.fromisoformat(mute_until)
-                if mute_date > datetime.utcnow():
-                    status.append(f"🔇 В муте до {mute_date.strftime('%d.%m.%Y %H:%M')}")
-            except:
-                pass
-        
-        if not status:
-            status = ["✅ Активен"]
-        
-        display_name = first_name if first_name else "нет"
-        if len(display_name) > 20:
-            display_name = display_name[:20] + "..."
-        
-        text = (
-            f"👤 <b>Пользователь</b>\n"
-            f"ID: <code>{user_id}</code>\n"
-            f"Username: @{username or 'нет'}\n"
-            f"Имя: {display_name}\n"
-            f"Статус: {', '.join(status)}"
-        )
-        
-        keyboard_buttons = []
-        
-        if message.from_user.id == SUPER_ADMIN:
-            keyboard_buttons = [
-                [InlineKeyboardButton(
-                    text="✅ Разбанить" if banned else "🔨 Забанить", 
-                    callback_data=f"toggle_ban_{user_id}"
-                )],
-                [InlineKeyboardButton(
-                    text="🔊 Размутить" if mute_until else "⏳ Замутить", 
-                    callback_data=f"toggle_mute_{user_id}"
-                )],
-                [InlineKeyboardButton(
-                    text="⭐ Убрать исключение" if maintenance_exception else "⭐ Добавить исключение", 
-                    callback_data=f"toggle_exception_{user_id}"
-                )]
-            ]
-        else:
-            keyboard_buttons = [
-                [InlineKeyboardButton(
-                    text="🔊 Размутить" if mute_until else "⏳ Замутить", 
-                    callback_data=f"toggle_mute_{user_id}"
-                )]
-            ]
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-        await message.answer(text, reply_markup=keyboard)
-        await asyncio.sleep(0.2)
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
+            current_style = (await cursor.fetchone())[0]
+    except Exception as e:
+        logger.error(f"DB error in admin_style: {e}")
+        current_style = "1"
     
-    await state.clear()
+    styles = {"1": "Обычный", "2": "С рамкой", "3": "Минимализм"}
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if current_style=='1' else ''}Стиль 1 - Обычный", 
+            callback_data="set_style_1"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if current_style=='2' else ''}Стиль 2 - С рамкой", 
+            callback_data="set_style_2"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if current_style=='3' else ''}Стиль 3 - Минимализм", 
+            callback_data="set_style_3"
+        )]
+    ])
+    
+    await message.answer(
+        f"🎨 <b>Текущий стиль: {styles[current_style]}</b>\n\nВыберите новый стиль:",
+        reply_markup=keyboard
+    )
 
-# ================= СПИСОК ЗАБАНЕННЫХ =================
-
-@dp.callback_query(F.data == "list_banned")
-async def list_banned(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("set_style_"))
+async def set_style(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
     
+    style_num = callback.data.split("_")[2]
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE settings SET value=? WHERE key='post_style'",
+                (style_num,)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"DB error in set_style: {e}")
+        await callback.answer("❌ Ошибка базы данных", show_alert=True)
+        return
+    
+    if "stats" in admin_cache:
+        del admin_cache["stats"]
+    
+    styles = {"1": "Обычный", "2": "С рамкой", "3": "Минимализм"}
+    await callback.answer(f"Стиль изменен на {styles[style_num]}")
+    await callback.message.edit_text(f"✅ Стиль успешно изменен на <b>{styles[style_num]}</b>")
+
+# ================= КАПЧА ДЛЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ =================
+
+async def check_user_captcha(user_id: int) -> bool:
+    """Проверяет, прошел ли пользователь капчу"""
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
-                "SELECT user_id, username, first_name FROM users WHERE banned=1 ORDER BY user_id DESC LIMIT 20"
+                "SELECT captcha_passed FROM users WHERE user_id=?",
+                (user_id,)
             )
-            banned_users = await cursor.fetchall()
-    except Exception as e:
-        logger.error(f"DB error in list_banned: {e}")
-        await callback.answer("❌ Ошибка получения списка")
-        return
-    
-    if not banned_users:
-        await callback.message.answer("📋 Список забаненных пуст")
-        await callback.answer()
-        return
-    
-    text = "📋 <b>Забаненные пользователи (последние 20):</b>\n\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-    
-    for user_id, username, first_name in banned_users:
-        display_name = first_name if first_name else "без имени"
-        if len(display_name) > 15:
-            display_name = display_name[:15] + "..."
-        
-        text += f"• {display_name} (@{username or 'нет'}) - <code>{user_id}</code>\n"
-        
-        if callback.from_user.id == SUPER_ADMIN:
-            keyboard.inline_keyboard.append([
-                InlineKeyboardButton(
-                    text=f"✅ Разбанить {user_id}", 
-                    callback_data=f"unban_{user_id}"
-                )
-            ])
-    
-    if keyboard.inline_keyboard:
-        await callback.message.answer(text, reply_markup=keyboard)
-    else:
-        await callback.message.answer(text)
-    
-    await callback.answer()
+            result = await cursor.fetchone()
+            return result and result[0] == 1
+    except:
+        return False
 
-# ================= СПИСОК ЗАМУЧЕННЫХ =================
-
-@dp.callback_query(F.data == "list_muted")
-async def list_muted(callback: CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return
-    
+async def set_captcha_passed(user_id: int):
+    """Отмечает, что пользователь прошел капчу"""
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute("""
-                SELECT user_id, username, first_name, mute_until 
-                FROM users 
-                WHERE mute_until > datetime('now') 
-                ORDER BY mute_until DESC 
-                LIMIT 20
-            """)
-            muted_users = await cursor.fetchall()
-    except Exception as e:
-        logger.error(f"DB error in list_muted: {e}")
-        await callback.answer("❌ Ошибка получения списка")
-        return
-    
-    if not muted_users:
-        await callback.message.answer("📋 Список замученных пуст")
-        await callback.answer()
-        return
-    
-    text = "📋 <b>Пользователи в муте (последние 20):</b>\n\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-    
-    for user_id, username, first_name, mute_until in muted_users:
-        display_name = first_name if first_name else "без имени"
-        if len(display_name) > 15:
-            display_name = display_name[:15] + "..."
-        
-        try:
-            mute_date = datetime.fromisoformat(mute_until)
-            date_str = mute_date.strftime('%d.%m.%Y %H:%M')
-        except:
-            date_str = mute_until[:16] if mute_until else "неизвестно"
-        
-        text += f"• {display_name} (@{username or 'нет'}) - <code>{user_id}</code>\n  до {date_str}\n"
-        
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(
-                text=f"🔊 Размутить {user_id}", 
-                callback_data=f"unmute_{user_id}"
+            await db.execute(
+                "UPDATE users SET captcha_passed=1 WHERE user_id=?",
+                (user_id,)
             )
-        ])
-    
-    await callback.message.answer(text, reply_markup=keyboard)
-    await callback.answer()
-
-# ================= ОБРАБОТЧИКИ UNBAN/UNMUTE =================
-
-@dp.callback_query(F.data.startswith("unban_"))
-async def unban_user(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
-        await callback.answer("❌ Только главный админ", show_alert=True)
-        return
-
-    user_id = int(callback.data.split("_")[1])
-
-    async with db_pool.acquire() as db:
-        await db.execute("UPDATE users SET banned=0 WHERE user_id=?", (user_id,))
-        await db.commit()
-
-    if user_id in user_cache:
-        del user_cache[user_id]
-
-    await callback.message.edit_text(f"✅ Пользователь {user_id} разбанен")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("unmute_"))
-async def unmute_user(callback: CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return
-
-    user_id = int(callback.data.split("_")[1])
-
-    async with db_pool.acquire() as db:
-        await db.execute("UPDATE users SET mute_until=NULL WHERE user_id=?", (user_id,))
-        await db.commit()
-
-    if user_id in user_cache:
-        del user_cache[user_id]
-
-    await callback.message.edit_text(f"✅ Пользователь {user_id} размучен")
-    await callback.answer()
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Error setting captcha passed: {e}")
 
 # ================= ОБРАБОТЧИК СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ =================
 
@@ -2060,7 +2152,8 @@ async def handle_user_media(message: Message, state: FSMContext):
         ["🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями", 
          "📨 Ожидающие проверки", "❌ Закрыть меню", "ℹ Информация", "❓ Помощь",
          "⏳ Временный мут", "📋 История действий", "📝 Черный список слов",
-         "❌ Отмена"]):
+         "❌ Отмена", "❔ FAQ", "📊 Создать опрос", "❓ Управление FAQ",
+         "🌐 Веб-панель"]):
         return
 
     # Проверяем техработы
@@ -2078,8 +2171,22 @@ async def handle_user_media(message: Message, state: FSMContext):
         except Exception as e:
             logger.error(f"DB error in maintenance check: {e}")
 
-    now = datetime.utcnow()
     user_id = message.from_user.id
+
+    # Проверяем капчу
+    if not await check_user_captcha(user_id):
+        question, answer = generate_captcha()
+        captcha_cache[user_id] = answer
+        
+        await message.answer(
+            "🤖 <b>Проверка на бота</b>\n\n"
+            f"Решите пример: <b>{question} = ?</b>\n\n"
+            "Отправьте ответ числом.\n"
+            "Это нужно сделать один раз."
+        )
+        return
+    
+    now = datetime.utcnow()
 
     # Проверяем кэш пользователя
     if user_id in user_cache:
@@ -2130,6 +2237,22 @@ async def handle_user_media(message: Message, state: FSMContext):
                     except:
                         pass
 
+            # Обработка ответа на капчу (если пользователь только её получил)
+            if user_id in captcha_cache:
+                if message.text and message.text.strip() == captcha_cache[user_id]:
+                    await set_captcha_passed(user_id)
+                    del captcha_cache[user_id]
+                    await message.answer("✅ Проверка пройдена! Теперь вы можете отправлять сообщения.")
+                    return
+                else:
+                    question, answer = generate_captcha()
+                    captcha_cache[user_id] = answer
+                    await message.answer(
+                        "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
+                        f"<b>{question} = ?</b>"
+                    )
+                    return
+
             # Определяем тип медиа
             media_type = None
             media_file_id = None
@@ -2157,7 +2280,7 @@ async def handle_user_media(message: Message, state: FSMContext):
                     last_message=excluded.last_message
             """, (user_id, message.from_user.username, message.from_user.first_name, now.isoformat()))
 
-            # Сохраняем сообщение (чистый текст, без HTML)
+            # Сохраняем сообщение
             cursor = await db.execute("""
                 INSERT INTO messages 
                 (user_id, text, media_type, media_file_id, created_at, has_links, insult_count) 
@@ -2193,7 +2316,6 @@ async def handle_user_media(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="🔍 Перейти к рассмотрению", callback_data=f"review_{msg_id}")]
     ])
 
-    # Предупреждения
     warnings = []
     if has_links_flag:
         warnings.append("🔗 ССЫЛКИ")
@@ -2206,12 +2328,10 @@ async def handle_user_media(message: Message, state: FSMContext):
     
     warning_text = f"\n\n⚠️ {' | '.join(warnings)}" if warnings else ""
     
-    # Экранируем текст для безопасного отображения
     display_text = escape_html(text) if text else "без текста"
 
     tasks = []
     for admin in ADMINS:
-        # Для SUPER_ADMIN показываем полную информацию
         if admin == SUPER_ADMIN:
             if media_type == "photo":
                 tasks.append(
@@ -2242,7 +2362,6 @@ async def handle_user_media(message: Message, state: FSMContext):
                         parse_mode=ParseMode.HTML
                     )
                 )
-        # Для обычных админов НЕ показываем ID и username
         else:
             if media_type == "photo":
                 tasks.append(
@@ -2284,7 +2403,7 @@ async def handle_user_media(message: Message, state: FSMContext):
             except Exception as e:
                 logger.error(f"Error sending to admin: {e}")
 
-# ================= ОТВЕТЫ НА СООБЩЕНИЯ (через БД) =================
+## ================= ОТВЕТЫ НА СООБЩЕНИЯ (через БД) =================
 
 @dp.callback_query(F.data.startswith("reply_"))
 async def reply_to_message(callback: CallbackQuery, state: FSMContext):
@@ -2307,42 +2426,12 @@ async def reply_to_message(callback: CallbackQuery, state: FSMContext):
 
     user_id = result[0]
     
-    # Сохраняем состояние ответа в БД
     try:
         async with db_pool.acquire() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO reply_states (admin_id, user_id, msg_id, reply_type, created_at)
                 VALUES (?, ?, ?, ?, ?)
             """, (callback.from_user.id, user_id, msg_id, "message", datetime.utcnow().isoformat()))
-            await db.commit()
-    except Exception as e:
-        logger.error(f"Error saving reply state: {e}")
-        await callback.answer("❌ Ошибка сохранения состояния")
-        return
-    
-    await state.set_state(AdminStates.waiting_for_reply_text)
-    await callback.message.answer(
-        f"📝 Введите текст ответа для пользователя <code>{user_id}</code>\n"
-        f"(или отправьте /cancel для отмены)"
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("adminmsg_reply_"))
-async def admin_message_reply(callback: CallbackQuery, state: FSMContext):
-    """Ответ на личное сообщение"""
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    
-    user_id = int(callback.data.split("_")[2])
-    
-    # Сохраняем состояние ответа в БД
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO reply_states (admin_id, user_id, msg_id, reply_type, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (callback.from_user.id, user_id, None, "admin_message", datetime.utcnow().isoformat()))
             await db.commit()
     except Exception as e:
         logger.error(f"Error saving reply state: {e}")
@@ -2365,9 +2454,7 @@ async def handle_reply_input(message: Message, state: FSMContext):
         await state.clear()
         return
     
-    # Проверка на отмену
     if message.text == "/cancel":
-        # Удаляем состояние из БД
         try:
             async with db_pool.acquire() as db:
                 await db.execute(
@@ -2382,7 +2469,6 @@ async def handle_reply_input(message: Message, state: FSMContext):
         await message.answer("❌ Ответ отменён")
         return
     
-    # Получаем данные из БД
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
@@ -2398,7 +2484,6 @@ async def handle_reply_input(message: Message, state: FSMContext):
             
             user_id, msg_id, reply_type = result
             
-            # Удаляем состояние из БД
             await db.execute(
                 "DELETE FROM reply_states WHERE admin_id=?",
                 (message.from_user.id,)
@@ -2410,21 +2495,11 @@ async def handle_reply_input(message: Message, state: FSMContext):
         await message.answer("❌ Ошибка чтения данных")
         return
     
-    # Отправляем ответ
     try:
         await bot.send_message(
             user_id,
             f"📝 <b>Ответ от администратора</b>\n\n{message.text}"
         )
-        
-        # Если это ответ на личное сообщение, обновляем статус
-        if reply_type == "admin_message":
-            async with db_pool.acquire() as db:
-                await db.execute(
-                    "UPDATE admin_messages SET status='replied' WHERE user_id=? AND status='new'",
-                    (user_id,)
-                )
-                await db.commit()
         
         await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
         await log_admin_action(message.from_user.id, "reply", user_id)
@@ -2452,7 +2527,7 @@ async def review(callback: CallbackQuery):
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
-                "SELECT reviewer, status, media_type, media_file_id, text, has_links, insult_count, skipped FROM messages WHERE id=?",
+                "SELECT reviewer, status, media_type, media_file_id, text, has_links, insult_count, skipped, poll_data FROM messages WHERE id=?",
                 (msg_id,)
             )
             result = await cursor.fetchone()
@@ -2461,7 +2536,7 @@ async def review(callback: CallbackQuery):
                 await callback.answer("Сообщение не найдено", show_alert=True)
                 return
 
-            reviewer, status, media_type, media_file_id, text, has_links, insult_count, skipped = result
+            reviewer, status, media_type, media_file_id, text, has_links, insult_count, skipped, poll_data = result
 
             if status != "pending":
                 await callback.answer("Уже обработано", show_alert=True)
@@ -2493,11 +2568,29 @@ async def review(callback: CallbackQuery):
 
     msg_cache[cache_key] = callback.from_user.id
 
-    # Экранируем текст для безопасного отображения
     escaped_text = escape_html(text) if text else ""
     
+    # Если это опрос, показываем предпросмотр
+    poll_preview = ""
+    if poll_data:
+        try:
+            poll = json.loads(poll_data)
+            poll_preview = f"\n\n📊 <b>ОПРОС</b>\nВопрос: {poll['question']}\n"
+            poll_preview += "Варианты:\n" + "\n".join([f"• {opt}" for opt in poll['options']])
+        except:
+            pass
+    
     # Создаем клавиатуру
-    if media_type == "photo":
+    if poll_data:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Опубликовать опрос", callback_data=f"approve_{msg_id}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{msg_id}")],
+            [InlineKeyboardButton(text="⏳ Мут 7д", callback_data=f"mute_{msg_id}")],
+            [InlineKeyboardButton(text="🔨 Бан", callback_data=f"ban_{msg_id}")],
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{msg_id}"),
+             InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel_review_{msg_id}")]
+        ])
+    elif media_type == "photo":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{msg_id}"),
@@ -2518,9 +2611,7 @@ async def review(callback: CallbackQuery):
         ])
     else:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{msg_id}")
-            ],
+            [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{msg_id}")],
             [
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{msg_id}"),
                 InlineKeyboardButton(text="⏳ Мут 7д", callback_data=f"mute_{msg_id}")
@@ -2540,7 +2631,7 @@ async def review(callback: CallbackQuery):
         warnings.append("🔗 ССЫЛКИ")
     if insult_count >= INSULT_THRESHOLD:
         warnings.append(f"🤬 ОСКОРБЛЕНИЯ ({insult_count})")
-    if media_type:
+    if media_type and not poll_data:
         warnings.append("🚫 МЕДИА")
     
     warning_text = f"\n\n⚠️ {' | '.join(warnings)}" if warnings else ""
@@ -2548,19 +2639,19 @@ async def review(callback: CallbackQuery):
     try:
         if media_type == "photo":
             await callback.message.edit_caption(
-                caption=callback.message.caption + warning_text + "\n\n🔄 <b>Рассматривается...</b>",
+                caption=callback.message.caption + warning_text + poll_preview + "\n\n🔄 <b>Рассматривается...</b>",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
         elif media_type == "video":
             await callback.message.edit_caption(
-                caption=callback.message.caption + warning_text + "\n\n🔄 <b>Рассматривается...</b>",
+                caption=callback.message.caption + warning_text + poll_preview + "\n\n🔄 <b>Рассматривается...</b>",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
         else:
             await callback.message.edit_text(
-                text=callback.message.text + warning_text + "\n\n🔄 <b>Рассматривается...</b>",
+                text=callback.message.text + warning_text + poll_preview + "\n\n🔄 <b>Рассматривается...</b>",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
@@ -2598,10 +2689,8 @@ async def approve_with_watermark(callback: CallbackQuery):
             await callback.answer("❌ Водяной знак только для фото", show_alert=True)
             return
 
-        # Начинаем транзакцию
         await db.execute("BEGIN TRANSACTION")
         try:
-            # Помечаем как "в обработке"
             await db.execute(
                 "UPDATE messages SET status='processing' WHERE id=? AND status='pending'",
                 (msg_id,)
@@ -2616,7 +2705,6 @@ async def approve_with_watermark(callback: CallbackQuery):
         new_file_id = await add_watermark_to_photo(media_file_id)
     except Exception as e:
         logger.error(f"Watermark error: {e}")
-        # Откатываем статус
         async with db_pool.acquire() as db:
             await db.execute(
                 "UPDATE messages SET status='pending', reviewer=NULL WHERE id=?",
@@ -2626,7 +2714,6 @@ async def approve_with_watermark(callback: CallbackQuery):
         await callback.answer("❌ Ошибка при наложении водяного знака", show_alert=True)
         return
 
-    # Получаем стиль и счетчик
     async with db_pool.acquire() as db:
         cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
         style = (await cursor.fetchone())[0]
@@ -2646,10 +2733,8 @@ async def approve_with_watermark(callback: CallbackQuery):
             await callback.answer("❌ Ошибка сохранения", show_alert=True)
             return
 
-    # Экранируем текст
     escaped_text = escape_html(text) if text else ""
     
-    # Форматируем пост
     if style == "1":
         header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
         footer = f"\n\n━━━━━━━━━━━━━━\n✉ <a href='https://t.me/{BOT_USERNAME}'>Отправить сообщение</a>"
@@ -2660,7 +2745,6 @@ async def approve_with_watermark(callback: CallbackQuery):
         header = f"📌 <b>Анонимное сообщение</b>\n\n"
         footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
 
-    # Публикуем фото с водяным знаком
     try:
         await bot.send_photo(
             CHANNEL_ID,
@@ -2670,7 +2754,6 @@ async def approve_with_watermark(callback: CallbackQuery):
         )
     except Exception as e:
         logger.error(f"Error publishing watermarked photo: {e}")
-        # Откатываем если не удалось опубликовать
         async with db_pool.acquire() as db:
             await db.execute(
                 "UPDATE messages SET status='processing', reviewed_at=NULL WHERE id=?",
@@ -2680,7 +2763,6 @@ async def approve_with_watermark(callback: CallbackQuery):
         await callback.answer("❌ Ошибка публикации", show_alert=True)
         return
 
-    # Проверяем тип сообщения для редактирования
     center_status = " + фото-вставка" if os.path.exists("watermark_center.png") else ""
     
     try:
@@ -2701,7 +2783,6 @@ async def approve_with_watermark(callback: CallbackQuery):
             pass
         await callback.message.answer(f"✅ Фото #{msg_id} опубликовано с водяным знаком{center_status}")
 
-    # Уведомляем пользователя
     try:
         await bot.send_message(user_id, "✅ Ваше фото опубликовано в канале с водяным знаком!")
     except:
@@ -2885,7 +2966,7 @@ async def cancel_review(callback: CallbackQuery):
     await callback.answer("Рассмотрение отменено")
     await log_admin_action(callback.from_user.id, "cancel_review", target_id=msg_id)
 
-# ================= ОДОБРЕНИЕ =================
+# ================= ОДОБРЕНИЕ (включая опросы) =================
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback: CallbackQuery):
@@ -2899,7 +2980,7 @@ async def approve(callback: CallbackQuery):
             await db.execute("BEGIN TRANSACTION")
             try:
                 cursor = await db.execute(
-                    "SELECT text, user_id, reviewer, media_type, media_file_id FROM messages WHERE id=?",
+                    "SELECT text, user_id, reviewer, media_type, media_file_id, poll_data FROM messages WHERE id=?",
                     (msg_id,)
                 )
                 result = await cursor.fetchone()
@@ -2909,14 +2990,13 @@ async def approve(callback: CallbackQuery):
                     await callback.answer("Сообщение не найдено", show_alert=True)
                     return
 
-                text, user_id, reviewer, media_type, media_file_id = result
+                text, user_id, reviewer, media_type, media_file_id, poll_data = result
 
                 if reviewer != callback.from_user.id:
                     await db.execute("ROLLBACK")
                     await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
                     return
 
-                # Помечаем как "в обработке"
                 await db.execute(
                     "UPDATE messages SET status='processing', reviewed_at=? WHERE id=? AND status='pending'",
                     (datetime.utcnow().isoformat(), msg_id)
@@ -2945,7 +3025,69 @@ async def approve(callback: CallbackQuery):
         cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
         style = (await cursor.fetchone())[0]
 
-    # Экранируем текст
+    # Если это опрос
+    if poll_data:
+        try:
+            poll = json.loads(poll_data)
+            
+            await bot.send_poll(
+                CHANNEL_ID,
+                question=poll['question'],
+                options=poll['options'],
+                is_anonymous=True,
+                allows_multiple_answers=poll.get('allows_multiple_answers', True),
+                type='regular'
+            )
+            
+            async with db_pool.acquire() as db:
+                await db.execute(
+                    "UPDATE messages SET status='approved' WHERE id=?",
+                    (msg_id,)
+                )
+                await db.commit()
+            
+            try:
+                await bot.send_message(user_id, "✅ Ваш опрос опубликован в канале!")
+            except:
+                pass
+            
+            for admin in ADMINS:
+                try:
+                    await bot.send_message(admin, f"📊 <b>Опубликован опрос #{counter}</b> (сообщение #{msg_id})")
+                except:
+                    pass
+            
+            await log_admin_action(callback.from_user.id, "approve", target_id=msg_id, details=f"poll #{counter}")
+            
+            try:
+                if callback.message.photo or callback.message.video:
+                    await callback.message.edit_caption(
+                        caption=callback.message.caption.replace("\n\n🔄 <b>Рассматривается...</b>", "") + "\n\n✅ <b>ОПРОС ОПУБЛИКОВАН</b>",
+                        reply_markup=None
+                    )
+                else:
+                    await callback.message.edit_text(
+                        text=callback.message.text.replace("\n\n🔄 <b>Рассматривается...</b>", "") + "\n\n✅ <b>ОПРОС ОПУБЛИКОВАН</b>",
+                        reply_markup=None
+                    )
+            except:
+                pass
+            
+            await callback.answer()
+            return
+            
+        except Exception as e:
+            logger.error(f"Error publishing poll: {e}")
+            async with db_pool.acquire() as db:
+                await db.execute(
+                    "UPDATE messages SET status='pending', reviewed_at=NULL WHERE id=?",
+                    (msg_id,)
+                )
+                await db.commit()
+            await callback.answer("❌ Ошибка при публикации опроса", show_alert=True)
+            return
+
+    # Обычное сообщение
     escaped_text = escape_html(text) if text else ""
     
     if style == "1":
@@ -2983,7 +3125,6 @@ async def approve(callback: CallbackQuery):
                 disable_web_page_preview=True
             )
         
-        # Если успешно, обновляем статус
         async with db_pool.acquire() as db:
             await db.execute(
                 "UPDATE messages SET status='approved' WHERE id=?",
@@ -2993,7 +3134,6 @@ async def approve(callback: CallbackQuery):
             
     except Exception as e:
         logger.error(f"PUBLISH ERROR: {e}")
-        # Откатываем статус
         async with db_pool.acquire() as db:
             await db.execute(
                 "UPDATE messages SET status='processing', reviewed_at=NULL WHERE id=?",
@@ -3316,35 +3456,362 @@ async def cancel_ban(callback: CallbackQuery):
         return
     await callback.message.edit_text("❌ Бан отменен")
 
-# ================= СМЕНА СТИЛЯ =================
+# ================= ПОИСК ПОЛЬЗОВАТЕЛЯ =================
 
-@dp.callback_query(F.data.startswith("set_style_"))
-async def set_style(callback: CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+@dp.message(F.text == "👥 Управление пользователями")
+async def admin_users(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMINS:
         return
     
-    style_num = callback.data.split("_")[2]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="find_user")],
+        [InlineKeyboardButton(text="📋 Список забаненных", callback_data="list_banned")],
+        [InlineKeyboardButton(text="📋 Список замученных", callback_data="list_muted")]
+    ])
+    
+    await message.answer(
+        "👥 <b>Управление пользователями</b>\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "find_user")
+async def find_user_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMINS:
+        return
+    await state.set_state(AdminStates.waiting_for_user_search)
+    await callback.message.answer(
+        "🔍 Введите ID пользователя, username или имя для поиска:\n(или отправьте /cancel для отмены)"
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_user_search)
+async def process_user_search(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMINS:
+        await state.clear()
+        return
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Поиск отменен")
+        return
+    
+    search = message.text.strip()
     
     try:
         async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE settings SET value=? WHERE key='post_style'",
-                (style_num,)
-            )
-            await db.commit()
+            cursor = await db.execute("""
+                SELECT user_id, username, first_name, banned, mute_until, maintenance_exception, captcha_passed
+                FROM users 
+                WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ?
+                LIMIT 10
+            """, (f"%{search}%", f"%{search}%", f"%{search}%"))
+            users = await cursor.fetchall()
     except Exception as e:
-        logger.error(f"DB error in set_style: {e}")
-        await callback.answer("❌ Ошибка базы данных", show_alert=True)
+        logger.error(f"DB error in process_user_search: {e}")
+        await message.answer("❌ Ошибка поиска")
+        await state.clear()
         return
     
-    if "stats" in admin_cache:
-        del admin_cache["stats"]
+    if not users:
+        await message.answer("❌ Пользователи не найдены")
+        await state.clear()
+        return
     
-    styles = {"1": "Обычный", "2": "С рамкой", "3": "Минимализм"}
-    await callback.answer(f"Стиль изменен на {styles[style_num]}")
-    await callback.message.edit_text(f"✅ Стиль успешно изменен на <b>{styles[style_num]}</b>")
+    for user in users:
+        user_id, username, first_name, banned, mute_until, maintenance_exception, captcha_passed = user
+        status = []
+        if banned:
+            status.append("⛔ Забанен")
+        if maintenance_exception:
+            status.append("⭐ Исключение")
+        if captcha_passed:
+            status.append("✅ Верифицирован")
+        else:
+            status.append("🤖 Не прошел капчу")
+        
+        if mute_until:
+            try:
+                mute_date = datetime.fromisoformat(mute_until)
+                if mute_date > datetime.utcnow():
+                    status.append(f"🔇 В муте до {mute_date.strftime('%d.%m.%Y %H:%M')}")
+            except:
+                pass
+        
+        if not status:
+            status = ["✅ Активен"]
+        
+        display_name = first_name if first_name else "нет"
+        if len(display_name) > 20:
+            display_name = display_name[:20] + "..."
+        
+        text = (
+            f"👤 <b>Пользователь</b>\n"
+            f"ID: <code>{user_id}</code>\n"
+            f"Username: @{username or 'нет'}\n"
+            f"Имя: {display_name}\n"
+            f"Статус: {', '.join(status)}"
+        )
+        
+        keyboard_buttons = []
+        
+        if message.from_user.id == SUPER_ADMIN:
+            keyboard_buttons = [
+                [InlineKeyboardButton(
+                    text="✅ Разбанить" if banned else "🔨 Забанить", 
+                    callback_data=f"toggle_ban_{user_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="🔊 Размутить" if mute_until else "⏳ Замутить", 
+                    callback_data=f"toggle_mute_{user_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="⭐ Убрать исключение" if maintenance_exception else "⭐ Добавить исключение", 
+                    callback_data=f"toggle_exception_{user_id}"
+                )]
+            ]
+        else:
+            keyboard_buttons = [
+                [InlineKeyboardButton(
+                    text="🔊 Размутить" if mute_until else "⏳ Замутить", 
+                    callback_data=f"toggle_mute_{user_id}"
+                )]
+            ]
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        await message.answer(text, reply_markup=keyboard)
+        await asyncio.sleep(0.2)
+    
+    await state.clear()
 
-# ================= ОБНОВЛЕНИЕ СПИСКА ОЖИДАЮЩИХ =================
+# ================= СПИСКИ ЗАБАНЕННЫХ/ЗАМУЧЕННЫХ =================
+
+@dp.callback_query(F.data == "list_banned")
+async def list_banned(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT user_id, username, first_name FROM users WHERE banned=1 ORDER BY user_id DESC LIMIT 20"
+            )
+            banned_users = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in list_banned: {e}")
+        await callback.answer("❌ Ошибка получения списка")
+        return
+    
+    if not banned_users:
+        await callback.message.answer("📋 Список забаненных пуст")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>Забаненные пользователи (последние 20):</b>\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for user_id, username, first_name in banned_users:
+        display_name = first_name if first_name else "без имени"
+        if len(display_name) > 15:
+            display_name = display_name[:15] + "..."
+        
+        text += f"• {display_name} (@{username or 'нет'}) - <code>{user_id}</code>\n"
+        
+        if callback.from_user.id == SUPER_ADMIN:
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"✅ Разбанить {user_id}", 
+                    callback_data=f"unban_{user_id}"
+                )
+            ])
+    
+    if keyboard.inline_keyboard:
+        await callback.message.answer(text, reply_markup=keyboard)
+    else:
+        await callback.message.answer(text)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "list_muted")
+async def list_muted(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("""
+                SELECT user_id, username, first_name, mute_until 
+                FROM users 
+                WHERE mute_until > datetime('now') 
+                ORDER BY mute_until DESC 
+                LIMIT 20
+            """)
+            muted_users = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in list_muted: {e}")
+        await callback.answer("❌ Ошибка получения списка")
+        return
+    
+    if not muted_users:
+        await callback.message.answer("📋 Список замученных пуст")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>Пользователи в муте (последние 20):</b>\n\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for user_id, username, first_name, mute_until in muted_users:
+        display_name = first_name if first_name else "без имени"
+        if len(display_name) > 15:
+            display_name = display_name[:15] + "..."
+        
+        try:
+            mute_date = datetime.fromisoformat(mute_until)
+            date_str = mute_date.strftime('%d.%m.%Y %H:%M')
+        except:
+            date_str = mute_until[:16] if mute_until else "неизвестно"
+        
+        text += f"• {display_name} (@{username or 'нет'}) - <code>{user_id}</code>\n  до {date_str}\n"
+        
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"🔊 Размутить {user_id}", 
+                callback_data=f"unmute_{user_id}"
+            )
+        ])
+    
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer()
+
+# ================= UNBAN/UNMUTE =================
+
+@dp.callback_query(F.data.startswith("unban_"))
+async def unban_user(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN:
+        await callback.answer("❌ Только главный админ", show_alert=True)
+        return
+
+    user_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as db:
+        await db.execute("UPDATE users SET banned=0 WHERE user_id=?", (user_id,))
+        await db.commit()
+
+    if user_id in user_cache:
+        del user_cache[user_id]
+
+    await callback.message.edit_text(f"✅ Пользователь {user_id} разбанен")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("unmute_"))
+async def unmute_user(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as db:
+        await db.execute("UPDATE users SET mute_until=NULL WHERE user_id=?", (user_id,))
+        await db.commit()
+
+    if user_id in user_cache:
+        del user_cache[user_id]
+
+    await callback.message.edit_text(f"✅ Пользователь {user_id} размучен")
+    await callback.answer()
+
+# ================= ОЖИДАЮЩИЕ ПРОВЕРКИ =================
+
+@dp.message(F.text == "📨 Ожидающие проверки")
+async def admin_pending_messages(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE status='pending' AND skipped=0"
+            )
+            total_pending = (await cursor.fetchone())[0]
+            
+            cursor = await db.execute("""
+                SELECT id, user_id, media_type, 
+                       substr(text, 1, 50) as short_text, 
+                       created_at, has_links, insult_count, poll_data
+                FROM messages 
+                WHERE status='pending' AND skipped=0
+                ORDER BY created_at DESC 
+                LIMIT 10
+            """)
+            pending_messages = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DB error in admin_pending_messages: {e}")
+        await message.answer("❌ Ошибка получения списка сообщений")
+        return
+    
+    if not pending_messages:
+        await message.answer("📨 Нет сообщений, ожидающих проверки")
+        return
+    
+    text = f"📨 Ожидают проверки: {total_pending}\n\n"
+    if total_pending > 10:
+        text += f"Показаны последние 10 из {total_pending}\n\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count, poll_data in pending_messages:
+        try:
+            msg_date = datetime.fromisoformat(created_at)
+            date_str = msg_date.strftime('%d.%m %H:%M')
+        except:
+            date_str = created_at[:16] if created_at else "неизвестно"
+        
+        if media_type == "poll":
+            emoji = "📊"
+            content_type = "Опрос"
+        elif media_type == "photo":
+            emoji = "📸"
+            content_type = "Фото"
+        elif media_type == "video":
+            emoji = "🎥"
+            content_type = "Видео"
+        else:
+            emoji = "📝"
+            content_type = "Текст"
+        
+        warnings = []
+        if has_links:
+            warnings.append("🔗")
+        if insult_count >= INSULT_THRESHOLD:
+            warnings.append(f"🤬{insult_count}")
+        
+        warning_str = f" {' '.join(warnings)}" if warnings else ""
+        
+        clean_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
+        display_text = clean_text.replace('\n', ' ').strip() if clean_text else "без текста"
+        if len(display_text) > 30:
+            display_text = display_text[:30] + "..."
+        
+        if message.from_user.id == SUPER_ADMIN:
+            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+            text += f"👤 ID: {user_id}\n"
+        else:
+            text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
+        
+        text += f"💬 {display_text}\n\n"
+        
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"🔍 Рассмотреть #{msg_id} ({content_type})",
+                callback_data=f"review_{msg_id}"
+            )
+        ])
+    
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="🔄 Обновить список", callback_data="refresh_pending")
+    ])
+    
+    await message.answer(text, reply_markup=keyboard)
 
 @dp.callback_query(F.data == "refresh_pending")
 async def refresh_pending(callback: CallbackQuery):
@@ -3362,7 +3829,7 @@ async def refresh_pending(callback: CallbackQuery):
             cursor = await db.execute("""
                 SELECT id, user_id, media_type, 
                        substr(text, 1, 50) as short_text, 
-                       created_at, has_links, insult_count
+                       created_at, has_links, insult_count, poll_data
                 FROM messages 
                 WHERE status='pending' AND skipped=0
                 ORDER BY created_at DESC 
@@ -3385,14 +3852,17 @@ async def refresh_pending(callback: CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     
-    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count in pending_messages:
+    for msg_id, user_id, media_type, short_text, created_at, has_links, insult_count, poll_data in pending_messages:
         try:
             msg_date = datetime.fromisoformat(created_at)
             date_str = msg_date.strftime('%d.%m %H:%M')
         except:
             date_str = created_at[:16] if created_at else "неизвестно"
         
-        if media_type == "photo":
+        if media_type == "poll":
+            emoji = "📊"
+            content_type = "Опрос"
+        elif media_type == "photo":
             emoji = "📸"
             content_type = "Фото"
         elif media_type == "video":
@@ -3410,7 +3880,6 @@ async def refresh_pending(callback: CallbackQuery):
         
         warning_str = f" {' '.join(warnings)}" if warnings else ""
         
-        # Очищаем текст от HTML-тегов
         clean_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
         display_text = clean_text.replace('\n', ' ').strip() if clean_text else "без текста"
         if len(display_text) > 30:
@@ -3470,34 +3939,26 @@ async def manage_exceptions(message: Message):
     
     await message.answer(text, reply_markup=keyboard)
 
-
 @dp.callback_query(F.data == "add_exception")
 async def add_exception_prompt(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != SUPER_ADMIN:
         return
     await state.set_state(AdminStates.waiting_for_exception_add)
-    await callback.message.answer(
-        "➕ Введите ID пользователя для добавления в исключение:\n(или отправьте /cancel для отмены)"
-    )
+    await callback.message.answer("➕ Введите ID пользователя для добавления в исключение:\n(или отправьте /cancel для отмены)")
     await callback.answer()
-
 
 @dp.callback_query(F.data == "remove_exception")
 async def remove_exception_prompt(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != SUPER_ADMIN:
         return
     await state.set_state(AdminStates.waiting_for_exception_remove)
-    await callback.message.answer(
-        "➖ Введите ID пользователя для удаления из исключения:\n(или отправьте /cancel для отмены)"
-    )
+    await callback.message.answer("➖ Введите ID пользователя для удаления из исключения:\n(или отправьте /cancel для отмены)")
     await callback.answer()
-
 
 @dp.callback_query(F.data == "close_exceptions")
 async def close_exceptions(callback: CallbackQuery):
     await callback.message.delete()
     await callback.answer()
-
 
 @dp.message(AdminStates.waiting_for_exception_add)
 async def process_add_exception(message: Message, state: FSMContext):
@@ -3518,23 +3979,17 @@ async def process_add_exception(message: Message, state: FSMContext):
     
     try:
         async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE users SET maintenance_exception=1 WHERE user_id=?",
-                (user_id,)
-            )
+            await db.execute("UPDATE users SET maintenance_exception=1 WHERE user_id=?", (user_id,))
             await db.commit()
-            
             maintenance_exceptions.add(user_id)
             
         await message.answer(f"✅ Пользователь {user_id} добавлен в исключение")
         await log_admin_action(message.from_user.id, "exception_add", user_id)
-        
     except Exception as e:
         logger.error(f"DB error in process_add_exception: {e}")
         await message.answer("❌ Ошибка при добавлении в исключение")
     
     await state.clear()
-
 
 @dp.message(AdminStates.waiting_for_exception_remove)
 async def process_remove_exception(message: Message, state: FSMContext):
@@ -3555,10 +4010,7 @@ async def process_remove_exception(message: Message, state: FSMContext):
     
     try:
         async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE users SET maintenance_exception=0 WHERE user_id=?",
-                (user_id,)
-            )
+            await db.execute("UPDATE users SET maintenance_exception=0 WHERE user_id=?", (user_id,))
             await db.commit()
             
             if user_id in maintenance_exceptions:
@@ -3566,21 +4018,39 @@ async def process_remove_exception(message: Message, state: FSMContext):
             
         await message.answer(f"✅ Пользователь {user_id} удален из исключения")
         await log_admin_action(message.from_user.id, "exception_remove", user_id)
-        
     except Exception as e:
         logger.error(f"DB error in process_remove_exception: {e}")
         await message.answer("❌ Ошибка при удалении из исключения")
     
     await state.clear()
 
-# ================= ГЛАВНАЯ ФУНКЦИЯ =================
+# ================= HTTP СЕРВЕР И API ДЛЯ WEB APP =================
+
+async def verify_telegram_auth(data: dict) -> bool:
+    """Проверяет подлинность данных из Telegram Web App"""
+    try:
+        check_hash = data.get('hash', '')
+        data_check_string = '\n'.join([
+            f"{k}={v}" for k, v in sorted(data.items()) 
+            if k != 'hash'
+        ])
+        
+        secret_key = hashlib.sha256(TOKEN.encode()).digest()
+        hmac_hash = hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac_hash == check_hash
+    except Exception as e:
+        logger.error(f"Auth verification error: {e}")
+        return False
 
 async def run_http_server():
-    """Запускает HTTP-сервер для health checks и пинга"""
+    """Запускает HTTP-сервер для health checks и Web App API"""
     try:
         from aiohttp import web
-        import time
-        from datetime import timedelta
         
         async def handle(request):
             uptime_seconds = time.time() - start_time
@@ -3590,7 +4060,6 @@ async def run_http_server():
                 async with db_pool.acquire() as db:
                     cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE status='pending'")
                     pending_count = (await cursor.fetchone())[0]
-                    
                     cursor = await db.execute("SELECT COUNT(*) FROM users")
                     users_count = (await cursor.fetchone())[0]
             except:
@@ -3603,8 +4072,6 @@ async def run_http_server():
                 "status": "ok",
                 "bot_name": BOT_USERNAME,
                 "uptime": uptime_str,
-                "users_in_cache": len(user_cache),
-                "pending_in_cache": len(pending_cache),
                 "pending_in_db": pending_count,
                 "total_users": users_count,
                 "night_mode_enabled": night_mode_enabled,
@@ -3616,12 +4083,195 @@ async def run_http_server():
                 "timestamp": datetime.utcnow().isoformat()
             })
         
+        async def api_dashboard(request):
+            """API для дашборда Web App"""
+            auth_header = request.headers.get('X-Telegram-Auth')
+            if not auth_header:
+                return web.json_response({"error": "Unauthorized"}, status=401)
+            
+            try:
+                async with db_pool.acquire() as db:
+                    cursor = await db.execute("""
+                        SELECT 
+                            (SELECT COUNT(*) FROM messages WHERE date(created_at) = date('now')) as today_posts,
+                            (SELECT COUNT(*) FROM messages WHERE status='pending' AND skipped=0) as pending_count,
+                            (SELECT COUNT(*) FROM users WHERE banned=1) as banned_count,
+                            (SELECT COUNT(*) FROM users) as total_users,
+                            (SELECT value FROM settings WHERE key='post_counter') as total_posts
+                    """)
+                    result = await cursor.fetchone()
+                    
+                    cursor = await db.execute("""
+                        SELECT admin_id, action, target_id, created_at
+                        FROM admin_actions
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                    """)
+                    recent_actions = await cursor.fetchall()
+                    
+                    actions_list = []
+                    for action in recent_actions:
+                        actions_list.append({
+                            "admin_id": action[0],
+                            "action": action[1],
+                            "target_id": action[2],
+                            "created_at": action[3]
+                        })
+                    
+                    mode, interval = get_current_mode_and_interval()
+                    
+                    return web.json_response({
+                        "today_posts": result[0] or 0,
+                        "pending_count": result[1] or 0,
+                        "banned_count": result[2] or 0,
+                        "total_users": result[3] or 0,
+                        "total_posts": result[4] or 0,
+                        "current_mode": mode,
+                        "interval": interval,
+                        "recent_actions": actions_list
+                    })
+            except Exception as e:
+                logger.error(f"API dashboard error: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+        
+        async def api_pending_messages(request):
+            """API для получения очереди сообщений"""
+            try:
+                async with db_pool.acquire() as db:
+                    cursor = await db.execute("""
+                        SELECT id, media_type, substr(text, 1, 100) as preview, created_at, has_links, insult_count
+                        FROM messages
+                        WHERE status='pending' AND skipped=0
+                        ORDER BY created_at DESC
+                        LIMIT 20
+                    """)
+                    messages = await cursor.fetchall()
+                    
+                    result = []
+                    for msg in messages:
+                        clean_text = re.sub(r'<[^>]+>', '', msg[2]) if msg[2] else ""
+                        result.append({
+                            "id": msg[0],
+                            "type": msg[1] or "text",
+                            "preview": clean_text[:100],
+                            "created_at": msg[3],
+                            "has_links": bool(msg[4]),
+                            "insult_count": msg[5] or 0
+                        })
+                    
+                    return web.json_response({"messages": result})
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        async def api_approve(request):
+            """API для одобрения сообщения"""
+            try:
+                data = await request.json()
+                msg_id = data.get('msg_id')
+                admin_id = data.get('admin_id')
+                
+                async with db_pool.acquire() as db:
+                    await db.execute("BEGIN TRANSACTION")
+                    try:
+                        await db.execute(
+                            "UPDATE messages SET status='approved', reviewed_at=?, reviewer=? WHERE id=?",
+                            (datetime.utcnow().isoformat(), admin_id, msg_id)
+                        )
+                        await db.commit()
+                    except:
+                        await db.execute("ROLLBACK")
+                        raise
+                
+                return web.json_response({"success": True})
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        async def api_reject(request):
+            """API для отклонения сообщения"""
+            try:
+                data = await request.json()
+                msg_id = data.get('msg_id')
+                admin_id = data.get('admin_id')
+                
+                async with db_pool.acquire() as db:
+                    await db.execute(
+                        "UPDATE messages SET status='rejected', reviewed_at=?, reviewer=? WHERE id=?",
+                        (datetime.utcnow().isoformat(), admin_id, msg_id)
+                    )
+                    await db.commit()
+                
+                return web.json_response({"success": True})
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        async def api_settings(request):
+            """API для получения/изменения настроек"""
+            if request.method == 'GET':
+                try:
+                    async with db_pool.acquire() as db:
+                        cursor = await db.execute("SELECT key, value FROM settings")
+                        settings = await cursor.fetchall()
+                        
+                        result = {}
+                        for key, value in settings:
+                            result[key] = value
+                        
+                        result['night_mode_enabled'] = night_mode_enabled
+                        result['auto_mode_enabled'] = auto_mode_enabled
+                        result['maintenance'] = maintenance_mode
+                        
+                        return web.json_response(result)
+                except Exception as e:
+                    return web.json_response({"error": str(e)}, status=500)
+            
+            elif request.method == 'POST':
+                try:
+                    data = await request.json()
+                    
+                    async with db_pool.acquire() as db:
+                        for key, value in data.items():
+                            await db.execute(
+                                "UPDATE settings SET value=? WHERE key=?",
+                                (str(value), key)
+                            )
+                        await db.commit()
+                    
+                    return web.json_response({"success": True})
+                except Exception as e:
+                    return web.json_response({"error": str(e)}, status=500)
+        
         app = web.Application()
+        
+        # Health check endpoints
         app.router.add_get('/', handle)
         app.router.add_get('/health', handle)
         app.router.add_get('/ping', handle)
         app.router.add_get('/status', handle)
-        app.router.add_get('/stats', handle)
+        
+        # Web App API endpoints
+        app.router.add_get('/api/dashboard', api_dashboard)
+        app.router.add_get('/api/pending', api_pending_messages)
+        app.router.add_post('/api/approve', api_approve)
+        app.router.add_post('/api/reject', api_reject)
+        app.router.add_get('/api/settings', api_settings)
+        app.router.add_post('/api/settings', api_settings)
+        
+        # CORS middleware
+        async def cors_middleware(app, handler):
+            async def middleware(request):
+                if request.method == 'OPTIONS':
+                    response = web.Response()
+                    response.headers['Access-Control-Allow-Origin'] = '*'
+                    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+                    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Auth'
+                    return response
+                
+                response = await handler(request)
+                response.headers['Access-Control-Allow-Origin'] = '*'
+                return response
+            return middleware
+        
+        app.middlewares.append(cors_middleware)
         
         runner = web.AppRunner(app)
         await runner.setup()
@@ -3630,10 +4280,12 @@ async def run_http_server():
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
         
-        logger.info(f"🌐 Advanced HTTP server started on port {port}")
+        logger.info(f"🌐 HTTP Server with Web App API started on port {port}")
         
     except Exception as e:
         logger.error(f"Failed to start HTTP server: {e}")
+
+# ================= ГЛАВНАЯ ФУНКЦИЯ =================
 
 async def main():
     global night_mode_enabled, auto_mode_enabled, maintenance_mode, shutdown_flag
@@ -3669,18 +4321,14 @@ async def main():
     
     logger.info("=" * 50)
     logger.info(f"🤖 Бот запущен!")
+    logger.info(f"📱 Web App: {WEB_APP_URL}")
     logger.info(f"👑 SUPER_ADMIN: {SUPER_ADMIN}")
     logger.info(f"👥 ADMINS: {ADMINS}")
     logger.info(f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}")
     logger.info(f"☀️ Авто-режим: {'✅' if auto_mode_enabled else '❌'}")
     logger.info(f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}")
     logger.info(f"📚 Черный список: {len(blacklist_cache)} слов")
-    
-    if os.path.exists("watermark_center.png"):
-        logger.info("🖼 Центральный водяной знак: watermark_center.png найден")
-    else:
-        logger.warning("🖼 Центральный водяной знак не найден.")
-    
+    logger.info(f"❓ FAQ записей: {len(faq_cache)}")
     logger.info("=" * 50)
     
     try:
