@@ -2423,14 +2423,24 @@ async def reset_captcha(user_id: int):
 async def handle_user_media(message: Message, state: FSMContext):
     """Обработка сообщений от обычных пользователей"""
     
-    # Пропускаем админов полностью
+    # ========== ПРОВЕРКА ДЛЯ АДМИНОВ ==========
+    # Если это админ и он нажал кнопку меню - пропускаем к специализированным хендлерам
     if message.from_user.id in ADMINS:
-        return
+        admin_buttons = [
+            "🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями",
+            "📨 Ожидающие проверки", "❌ Закрыть меню", "⏳ Временный мут",
+            "📋 История действий", "📝 Черный список слов", "❓ Управление FAQ",
+            "🌐 Веб-панель", "👥 Управление исключениями",
+            "🌙 Ночной режим", "☀️ Авто-режим", "🛠 Техработы"
+        ]
+        if message.text in admin_buttons:
+            return False  # Пропускаем к специализированным хендлерам
+        return  # Игнорируем обычные сообщения от админов
+    # ==========================================
 
-    # Проверяем, не в состоянии ли FSM (кроме состояний, где нужен ввод текста)
+    # Проверяем, не в состоянии ли FSM
     current_state = await state.get_state()
     if current_state is not None:
-        # Разрешаем только состояния, где ожидается ввод текста
         allowed_states = [
             "AdminStates:waiting_for_faq_question",
             "AdminStates:waiting_for_poll_question",
@@ -2439,13 +2449,14 @@ async def handle_user_media(message: Message, state: FSMContext):
         if current_state not in allowed_states:
             return
 
-    # Игнорируем команды и кнопки меню
+    # Игнорируем команды и кнопки меню для обычных пользователей
     if message.text and (message.text.startswith('/') or message.text in 
         ["🎨 Сменить стиль", "📊 Статистика", "👥 Управление пользователями", 
          "📨 Ожидающие проверки", "❌ Закрыть меню", "ℹ Информация", "❓ Помощь",
          "⏳ Временный мут", "📋 История действий", "📝 Черный список слов",
          "❌ Отмена", "❔ FAQ", "📊 Создать опрос", "❓ Управление FAQ",
-         "🌐 Веб-панель"]):
+         "🌐 Веб-панель", "👥 Управление исключениями",
+         "🌙 Ночной режим", "☀️ Авто-режим", "🛠 Техработы"]):
         return
 
     # Проверяем техработы
@@ -2467,34 +2478,41 @@ async def handle_user_media(message: Message, state: FSMContext):
 
     # ========== ПРОВЕРКА КАПЧИ ==========
     if not await check_user_captcha(user_id):
-        # Пользователь не прошел капчу
         if user_id in captcha_cache:
             # Уже есть активная капча - проверяем ответ
-            is_correct = await verify_captcha_answer(message)
-            
-            if is_correct:
+            if message.text and message.text.strip() == captcha_cache[user_id]:
                 # Правильный ответ!
+                await set_captcha_passed(user_id)
+                del captcha_cache[user_id]
                 await message.answer(
                     "✅ Проверка пройдена! Теперь вы можете отправлять сообщения.\n\n"
                     "Отправьте текст, фото или видео для публикации.\n"
                     "Используйте кнопки меню для навигации."
                 )
+                return
             else:
                 # Неправильный ответ
+                question, answer = generate_captcha()
+                captcha_cache[user_id] = answer
                 await message.answer(
                     "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
-                    f"<b>{captcha_cache[user_id][0] if isinstance(captcha_cache.get(user_id), tuple) else ''}</b>\n\n"
+                    f"<b>{question} = ?</b>\n\n"
                     "Отправьте только число."
                 )
-                # Отправляем новую капчу (уже сгенерирована в verify_captcha_answer)
-                question = captcha_cache.get(user_id)
-                if question:
-                    await message.answer(f"<b>{question} = ?</b>")
+                return
         else:
             # Первый раз - отправляем капчу
-            await send_captcha(message)
-        
-        return
+            question, answer = generate_captcha()
+            captcha_cache[user_id] = answer
+            
+            await message.answer(
+                "🤖 <b>Проверка на бота</b>\n\n"
+                f"Решите пример: <b>{question} = ?</b>\n\n"
+                "Отправьте только число в ответном сообщении.\n"
+                "Это нужно сделать один раз."
+            )
+            return
+    # ===================================
     
     now = datetime.utcnow()
 
@@ -2547,22 +2565,6 @@ async def handle_user_media(message: Message, state: FSMContext):
                     except:
                         pass
 
-            # Обработка ответа на капчу (если пользователь только её получил)
-            if user_id in captcha_cache:
-                if message.text and message.text.strip() == captcha_cache[user_id]:
-                    await set_captcha_passed(user_id)
-                    del captcha_cache[user_id]
-                    await message.answer("✅ Проверка пройдена! Теперь вы можете отправлять сообщения.")
-                    return
-                else:
-                    question, answer = generate_captcha()
-                    captcha_cache[user_id] = answer
-                    await message.answer(
-                        "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
-                        f"<b>{question} = ?</b>"
-                    )
-                    return
-
             # Определяем тип медиа
             media_type = None
             media_file_id = None
@@ -2607,8 +2609,6 @@ async def handle_user_media(message: Message, state: FSMContext):
 
     # Обновляем кэш
     user_cache[user_id] = {'banned': False, 'mute_until': None, 'last_message': now}
-
-    # Очищаем кэш
     if "stats" in admin_cache:
         del admin_cache["stats"]
     pending_cache.clear()
@@ -2637,7 +2637,6 @@ async def handle_user_media(message: Message, state: FSMContext):
         warnings.append("🚫 МЕДИА")
     
     warning_text = f"\n\n⚠️ {' | '.join(warnings)}" if warnings else ""
-    
     display_text = escape_html(text) if text else "без текста"
 
     tasks = []
