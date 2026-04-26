@@ -4811,26 +4811,30 @@ async def run_http_server():
                     return web.json_response({"error": str(e)}, status=500)
             
             elif request.method == 'POST':
-                try:
-                    data = await request.json()
-                    global night_mode_enabled, auto_mode_enabled, maintenance_mode
-                    
-                    async with db_pool.acquire() as db:
-                        for key, value in data.items():
-                            await db.execute(
-                                "UPDATE settings SET value=? WHERE key=?",
-                                (str(value), key)
-                            )
-                            
-                            # Обновляем глобальные флаги
-                            if key == 'night_mode':
-                                night_mode_enabled = value == '1'
-                            elif key == 'auto_mode':
-                                auto_mode_enabled = value == '1'
-                            elif key == 'maintenance':
-                                maintenance_mode = value == '1'
-                        
-                        await db.commit()
+    try:
+        data = await request.json()
+        
+        async with db_pool.acquire() as db:
+            for key, value in data.items():
+                await db.execute(
+                    "UPDATE settings SET value=? WHERE key=?",
+                    (str(value), key)
+                )
+                
+                # Обновляем глобальные флаги через nonlocal если нужно
+                # или используем модульные переменные напрямую
+                if key == 'night_mode':
+                    globals()['night_mode_enabled'] = value == '1'
+                elif key == 'auto_mode':
+                    globals()['auto_mode_enabled'] = value == '1'
+                elif key == 'maintenance':
+                    globals()['maintenance_mode'] = value == '1'
+            
+            await db.commit()
+        
+        return web.json_response({"success": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
                     
                     return web.json_response({"success": True})
                 except Exception as e:
