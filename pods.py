@@ -377,6 +377,16 @@ async def init_db():
         )
         """)
         
+        # ========== ДОБАВЬ ЭТОТ БЛОК (сразу после создания таблицы users) ==========
+        # Проверяем и добавляем колонку captcha_passed если её нет
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN captcha_passed INTEGER DEFAULT 0")
+            await db.commit()
+            logger.info("✅ Добавлена колонка captcha_passed в таблицу users")
+        except:
+            pass  # Колонка уже существует
+        # ========================================================================
+        
         await db.execute("""
         CREATE TABLE IF NOT EXISTS messages(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2228,36 +2238,6 @@ async def set_style(callback: CallbackQuery):
 
 # ================= КАПЧА ДЛЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ =================
 
-async def check_user_captcha(user_id: int) -> bool:
-    """Проверяет, прошел ли пользователь капчу.
-    Админы автоматически считаются прошедшими."""
-    if user_id in ADMINS:
-        return True
-    
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT captcha_passed FROM users WHERE user_id=?",
-                (user_id,)
-            )
-            result = await cursor.fetchone()
-            return result and result[0] == 1
-    except:
-        return False
-
-async def set_captcha_passed(user_id: int):  # ← ВОТ ЭТУ ФУНКЦИЮ ДОБАВЬ
-    """Отмечает, что пользователь прошел капчу"""
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE users SET captcha_passed=1 WHERE user_id=?",
-                (user_id,)
-            )
-            await db.commit()
-        logger.info(f"Captcha passed for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error setting captcha passed: {e}")
-
 def generate_captcha() -> tuple:
     """Генерирует простую математическую капчу"""
     a = random.randint(1, 20)
@@ -2279,20 +2259,185 @@ def generate_captcha() -> tuple:
     
     return question, str(answer)
 
+async def check_user_captcha(user_id: int) -> bool:
+    """Проверяет, прошел ли пользователь капчу.
+    Админы автоматически считаются прошедшими.
+    Возвращает True если капча пройдена или проверка не нужна."""
+    
+    # Админы всегда проходят
+    if user_id in ADMINS:
+        return True
+    
+    # Супер-админ тоже всегда проходит
+    if user_id == SUPER_ADMIN:
+        return True
+    
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT captcha_passed FROM users WHERE user_id=?",
+                (user_id,)
+            )
+            result = await cursor.fetchone()
+            
+            # Если пользователь есть в БД и прошел капчу
+            if result and result[0] == 1:
+                return True
+            
+            # Если пользователь есть, но не прошел капчу
+            if result and result[0] == 0:
+                return False
+            
+            # Если пользователя нет в БД - создаем запись
+            if not result:
+                await db.execute(
+                    "INSERT OR IGNORE INTO users (user_id, captcha_passed) VALUES (?, 0)",
+                    (user_id,)
+                )
+                await db.commit()
+                return False
+            
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error checking captcha for user {user_id}: {e}")
+        # В случае ошибки БД - пропускаем пользователя
+        return True
+
+async def set_captcha_passed(user_id: int):
+    """Отмечает, что пользователь прошел капчу"""
+    if user_id in ADMINS or user_id == SUPER_ADMIN:
+        return  # Админам не нужно отмечать
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE users SET captcha_passed=1 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+            logger.info(f"✅ Captcha passed for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error setting captcha passed for user {user_id}: {e}")
+        # Пробуем создать колонку, если её нет
+        try:
+            async with db_pool.acquire() as db:
+                # Проверяем, существует ли колонка
+                try:
+                    await db.execute("ALTER TABLE users ADD COLUMN captcha_passed INTEGER DEFAULT 0")
+                    await db.commit()
+                    logger.info("Added captcha_passed column to users table")
+                except:
+                    pass  # Колонка уже существует или другая ошибка
+                
+                # Пробуем снова обновить
+                await db.execute(
+                    "UPDATE users SET captcha_passed=1 WHERE user_id=?",
+                    (user_id,)
+                )
+                await db.commit()
+                logger.info(f"✅ Captcha passed for user {user_id} (after fix)")
+        except Exception as e2:
+            logger.error(f"Failed to set captcha passed for user {user_id}: {e2}")
+
+async def ensure_captcha_column():
+    """Проверяет и добавляет колонку captcha_passed если её нет"""
+    try:
+        async with db_pool.acquire() as db:
+            # Пробуем выполнить запрос к колонке
+            try:
+                await db.execute("SELECT captcha_passed FROM users LIMIT 1")
+            except:
+                # Колонки нет - добавляем
+                await db.execute("ALTER TABLE users ADD COLUMN captcha_passed INTEGER DEFAULT 0")
+                await db.commit()
+                logger.info("✅ Added captcha_passed column to existing users table")
+    except Exception as e:
+        logger.error(f"Error ensuring captcha column: {e}")
+
+# Функция для отображения капчи пользователю
+async def send_captcha(message: Message):
+    """Отправляет капчу пользователю"""
+    user_id = message.from_user.id
+    
+    question, answer = generate_captcha()
+    captcha_cache[user_id] = answer
+    
+    await message.answer(
+        "🤖 <b>Проверка на бота</b>\n\n"
+        f"Решите пример: <b>{question} = ?</b>\n\n"
+        "Отправьте только число в ответном сообщении.\n"
+        "Это нужно сделать один раз.",
+        parse_mode=ParseMode.HTML
+    )
+
+# Функция для проверки ответа на капчу
+async def verify_captcha_answer(message: Message) -> bool:
+    """Проверяет ответ пользователя на капчу.
+    Возвращает True если ответ правильный."""
+    user_id = message.from_user.id
+    
+    # Если пользователь не в кэше капчи - странная ситуация
+    if user_id not in captcha_cache:
+        return False
+    
+    # Проверяем, что сообщение текстовое
+    if not message.text:
+        return False
+    
+    # Сравниваем ответ
+    user_answer = message.text.strip()
+    correct_answer = captcha_cache[user_id]
+    
+    if user_answer == correct_answer:
+        # Правильный ответ
+        await set_captcha_passed(user_id)
+        del captcha_cache[user_id]
+        return True
+    else:
+        # Неправильный ответ - генерируем новую капчу
+        question, answer = generate_captcha()
+        captcha_cache[user_id] = answer
+        return False
+
+# Функция для сброса капчи (если нужно)
+async def reset_captcha(user_id: int):
+    """Сбрасывает статус капчи для пользователя (для отладки)"""
+    if user_id in captcha_cache:
+        del captcha_cache[user_id]
+    
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE users SET captcha_passed=0 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+        logger.info(f"Captcha reset for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error resetting captcha: {e}")
+
 # ================= ОБРАБОТЧИК СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ =================
 
 @dp.message(F.photo | F.video | F.text)
 async def handle_user_media(message: Message, state: FSMContext):
     """Обработка сообщений от обычных пользователей"""
     
-    # Пропускаем админов (они не проходят капчу)
+    # Пропускаем админов полностью
     if message.from_user.id in ADMINS:
         return
 
-    # Проверяем, не в состоянии ли FSM (кроме капчи)
+    # Проверяем, не в состоянии ли FSM (кроме состояний, где нужен ввод текста)
     current_state = await state.get_state()
-    if current_state is not None and current_state != "AdminStates:waiting_for_faq_question":
-        return
+    if current_state is not None:
+        # Разрешаем только состояния, где ожидается ввод текста
+        allowed_states = [
+            "AdminStates:waiting_for_faq_question",
+            "AdminStates:waiting_for_poll_question",
+            "AdminStates:waiting_for_poll_options"
+        ]
+        if current_state not in allowed_states:
+            return
 
     # Игнорируем команды и кнопки меню
     if message.text and (message.text.startswith('/') or message.text in 
@@ -2320,41 +2465,36 @@ async def handle_user_media(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
 
-    # Проверяем капчу
+    # ========== ПРОВЕРКА КАПЧИ ==========
     if not await check_user_captcha(user_id):
-        # Если пользователь в кэше капчи - проверяем ответ
+        # Пользователь не прошел капчу
         if user_id in captcha_cache:
-            if message.text and message.text.strip() == captcha_cache[user_id]:
+            # Уже есть активная капча - проверяем ответ
+            is_correct = await verify_captcha_answer(message)
+            
+            if is_correct:
                 # Правильный ответ!
-                await set_captcha_passed(user_id)
-                del captcha_cache[user_id]
                 await message.answer(
                     "✅ Проверка пройдена! Теперь вы можете отправлять сообщения.\n\n"
-                    "Отправьте текст, фото или видео для публикации."
+                    "Отправьте текст, фото или видео для публикации.\n"
+                    "Используйте кнопки меню для навигации."
                 )
-                return
             else:
-                # Неправильный ответ - генерируем новую капчу
-                question, answer = generate_captcha()
-                captcha_cache[user_id] = answer
+                # Неправильный ответ
                 await message.answer(
                     "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
-                    f"<b>{question} = ?</b>\n\n"
+                    f"<b>{captcha_cache[user_id][0] if isinstance(captcha_cache.get(user_id), tuple) else ''}</b>\n\n"
                     "Отправьте только число."
                 )
-                return
+                # Отправляем новую капчу (уже сгенерирована в verify_captcha_answer)
+                question = captcha_cache.get(user_id)
+                if question:
+                    await message.answer(f"<b>{question} = ?</b>")
         else:
-            # Первый раз - генерируем капчу
-            question, answer = generate_captcha()
-            captcha_cache[user_id] = answer
-            
-            await message.answer(
-                "🤖 <b>Проверка на бота</b>\n\n"
-                f"Решите пример: <b>{question} = ?</b>\n\n"
-                "Отправьте только число в ответном сообщении.\n"
-                "Это нужно сделать один раз."
-            )
-            return
+            # Первый раз - отправляем капчу
+            await send_captcha(message)
+        
+        return
     
     now = datetime.utcnow()
 
