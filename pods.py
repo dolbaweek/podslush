@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from PIL import Image, ImageDraw, ImageFont
 import io
 import tempfile
+import html
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -72,6 +73,9 @@ maintenance_mode = False
 maintenance_exceptions = set()
 shutdown_flag = False
 start_time = time.time()
+
+# Блокировка для автоматической публикации
+publish_lock = asyncio.Lock()
 
 # ================= БАЗОВЫЕ СПИСКИ СЛОВ =================
 
@@ -182,7 +186,7 @@ DEFAULT_INSULTS = [
     "блядун", "блядуна", "блядуну", "блядуном",
     "блядища", "блядищи", "блядище", "блядищу",
 
-    # ДОЛБОЕБ / ЕБЛАН й
+    # ДОЛБОЕБ / ЕБЛАН
     "долбоеб", "долбоеба", "долбоебу", "долбоебом", "долбоебе", "долбоебы", "долбоебов",
     "долбоящер", "долбоящера", "долбоящеры",
     "еблан", "еблана", "еблану", "ебланом", "еблане", "ебланы", "ебланов",
@@ -334,6 +338,14 @@ ADMIN_MESSAGE_INFO = (
     "Напишите ваше сообщение одним текстом:"
 )
 
+# ================= ФУНКЦИЯ ЭКРАНИРОВАНИЯ HTML =================
+
+def escape_html(text: str) -> str:
+    """Экранирует HTML-теги в тексте"""
+    if not text:
+        return ""
+    return html.escape(text, quote=False)
+
 # ================= СОСТОЯНИЯ FSM =================
 
 class AdminStates(StatesGroup):
@@ -345,6 +357,7 @@ class AdminStates(StatesGroup):
     waiting_for_mute_duration = State()
     waiting_for_mute_user = State()
     waiting_for_admin_message = State()
+    waiting_for_reply_text = State()  # Новое состояние для ответов
 
 # ================= ПУЛ БАЗЫ ДАННЫХ =================
 
@@ -727,6 +740,17 @@ async def init_db():
         )
         """)
         
+        # Новая таблица для хранения состояний ответов
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS reply_states(
+            admin_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            msg_id INTEGER,
+            reply_type TEXT,
+            created_at TEXT
+        )
+        """)
+        
         for word in DEFAULT_INSULTS:
             try:
                 await db.execute(
@@ -775,73 +799,113 @@ async def notify_admins_about_auto_post(msg_id: int, user_id: int, media_type: s
             pass
 
 async def post_next_message():
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute("""
-                SELECT id, user_id, text, media_type, media_file_id, has_links, insult_count
-                FROM messages 
-                WHERE status='pending' AND reviewer IS NULL AND skipped=0
-                ORDER BY created_at ASC 
-                LIMIT 1
-            """)
-            message = await cursor.fetchone()
+    """Публикует следующее сообщение из очереди (с блокировкой)"""
+    async with publish_lock:  # Блокировка для предотвращения дублей
+        try:
+            async with db_pool.acquire() as db:
+                # Используем транзакцию
+                await db.execute("BEGIN TRANSACTION")
+                
+                try:
+                    cursor = await db.execute("""
+                        SELECT id, user_id, text, media_type, media_file_id, has_links, insult_count
+                        FROM messages 
+                        WHERE status='pending' AND reviewer IS NULL AND skipped=0
+                        ORDER BY created_at ASC 
+                        LIMIT 1
+                    """)
+                    message = await cursor.fetchone()
+                    
+                    if not message:
+                        await db.execute("ROLLBACK")
+                        return
+                    
+                    msg_id, user_id, text, media_type, media_file_id, has_links, insult_count = message
+                    has_immoral = has_immoral_content(text) if text else False
+                    
+                    can_auto_post = (
+                        media_type is None and
+                        not has_links and
+                        not has_immoral and
+                        insult_count < INSULT_THRESHOLD
+                    )
+                    
+                    if not can_auto_post:
+                        await db.execute("ROLLBACK")
+                        return
+                    
+                    # Помечаем как "в обработке" чтобы другие потоки не взяли
+                    await db.execute("""
+                        UPDATE messages 
+                        SET status='processing', reviewed_at=? 
+                        WHERE id=? AND status='pending'
+                    """, (datetime.utcnow().isoformat(), msg_id))
+                    
+                    cursor = await db.execute("SELECT value FROM settings WHERE key='post_counter'")
+                    counter = int((await cursor.fetchone())[0]) + 1
+                    await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
+                    
+                    await db.commit()  # Фиксируем изменения в БД
+                    
+                except Exception as e:
+                    await db.execute("ROLLBACK")
+                    logger.error(f"DB error in post_next_message: {e}")
+                    return
             
-            if not message:
+            # Получаем стиль
+            async with db_pool.acquire() as db:
+                cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
+                style = (await cursor.fetchone())[0]
+            
+            # Экранируем текст и формируем сообщение
+            escaped_text = escape_html(text) if text else ""
+            
+            if style == "1":
+                header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
+                footer = f"\n\n━━━━━━━━━━━━━━\n✉ <a href='https://t.me/{BOT_USERNAME}'>Отправить сообщение</a>"
+            elif style == "2":
+                header = f"┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
+                footer = f"\n\n➖➖➖➖➖➖➖➖➖\n✉ <a href='https://t.me/{BOT_USERNAME}'>Написать анонимно</a>"
+            else:
+                header = f"📌 <b>Анонимное сообщение</b>\n\n"
+                footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
+            
+            # Отправляем в канал
+            try:
+                await bot.send_message(
+                    CHANNEL_ID,
+                    f"{header}<blockquote>{escaped_text}</blockquote>{footer}",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.error(f"Error sending to channel: {e}")
+                # Откатываем статус если не удалось отправить
+                async with db_pool.acquire() as db:
+                    await db.execute(
+                        "UPDATE messages SET status='pending', reviewed_at=NULL WHERE id=?",
+                        (msg_id,)
+                    )
+                    await db.commit()
                 return
             
-            msg_id, user_id, text, media_type, media_file_id, has_links, insult_count = message
-            has_immoral = has_immoral_content(text) if text else False
+            # Обновляем статус на approved
+            async with db_pool.acquire() as db:
+                await db.execute("""
+                    UPDATE messages 
+                    SET status='approved', auto_posted=1 
+                    WHERE id=?
+                """, (msg_id,))
+                await db.commit()
             
-            can_auto_post = (
-                media_type is None and
-                not has_links and
-                not has_immoral and
-                insult_count < INSULT_THRESHOLD
-            )
+            # Определяем режим для уведомления
+            hour = (datetime.utcnow() + timedelta(hours=3)).hour
+            mode = 'night' if hour < 8 else 'auto'
             
-            if not can_auto_post:
-                return
+            await notify_admins_about_auto_post(msg_id, user_id, "текст", counter, mode)
             
-            await db.execute("""
-                UPDATE messages 
-                SET status='approved', reviewed_at=?, auto_posted=1 
-                WHERE id=?
-            """, (datetime.utcnow().isoformat(), msg_id))
-            
-            cursor = await db.execute("SELECT value FROM settings WHERE key='post_counter'")
-            counter = int((await cursor.fetchone())[0]) + 1
-            await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
-            await db.commit()
-        
-        async with db_pool.acquire() as db:
-            cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
-            style = (await cursor.fetchone())[0]
-        
-        if style == "1":
-            header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
-            footer = f"\n\n━━━━━━━━━━━━━━\n✉ <a href='https://t.me/{BOT_USERNAME}'>Отправить сообщение</a>"
-        elif style == "2":
-            header = f"┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
-            footer = f"\n\n➖➖➖➖➖➖➖➖➖\n✉ <a href='https://t.me/{BOT_USERNAME}'>Написать анонимно</a>"
-        else:
-            header = f"📌 <b>Анонимное сообщение</b>\n\n"
-            footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
-        
-        await bot.send_message(
-            CHANNEL_ID,
-            f"{header}<blockquote>{text}</blockquote>{footer}",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
-        
-        # Определяем режим для уведомления
-        hour = (datetime.utcnow() + timedelta(hours=3)).hour
-        mode = 'night' if hour < 8 else 'auto'
-        
-        await notify_admins_about_auto_post(msg_id, user_id, "текст", counter, mode)
-        
-    except Exception as e:
-        logger.error(f"Ошибка авто-публикации: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка авто-публикации: {e}")
 
 async def auto_post_messages():
     global night_mode_enabled, auto_mode_enabled, shutdown_flag
@@ -893,6 +957,9 @@ async def check_long_pending_messages():
                 for msg in old_messages:
                     msg_id, user_id, media_type, short_text, created_at = msg
                     
+                    # Очищаем текст от HTML для безопасного отображения
+                    clean_short_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
+                    
                     # Для SUPER_ADMIN показываем ID
                     for admin in ADMINS:
                         if admin == SUPER_ADMIN:
@@ -901,7 +968,7 @@ async def check_long_pending_messages():
                                 f"Висит в очереди больше {LONG_MESSAGE_THRESHOLD} минут!\n"
                                 f"Тип: {media_type or 'текст'}\n"
                                 f"Время отправки: {created_at[:16]}\n"
-                                f"Текст: {short_text}\n"
+                                f"Текст: {clean_short_text}\n"
                                 f"От пользователя: <code>{user_id}</code>"
                             )
                         else:
@@ -910,7 +977,7 @@ async def check_long_pending_messages():
                                 f"Висит в очереди больше {LONG_MESSAGE_THRESHOLD} минут!\n"
                                 f"Тип: {media_type or 'текст'}\n"
                                 f"Время отправки: {created_at[:16]}\n"
-                                f"Текст: {short_text}"
+                                f"Текст: {clean_short_text}"
                             )
                         
                         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1071,143 +1138,6 @@ async def help_text(message: Message):
         "• Реклама\n\n"
         "Фото и видео всегда проходят ручную проверку."
     )
-
-# ================= ФУНКЦИЯ "НАПИСАТЬ АДМИНУ" (ЗАКОММЕНТИРОВАНА) =================
-
-# @dp.message(F.text == "📩 Написать админу")
-# async def ask_admin(message: Message, state: FSMContext):
-#     user_id = message.from_user.id
-# 
-#     if user_id in user_message_cooldown:
-#         remaining = user_message_cooldown[user_id]
-#         minutes = remaining // 60
-#         seconds = remaining % 60
-#         await message.answer(f"⏳ Вы уже отправляли сообщение. Подождите {minutes} мин {seconds} сек.")
-#         return
-# 
-#     keyboard = ReplyKeyboardMarkup(
-#         keyboard=[[KeyboardButton(text="❌ Отмена")]],
-#         resize_keyboard=True,
-#         one_time_keyboard=True
-#     )
-# 
-#     await state.set_state(AdminStates.waiting_for_admin_message)
-#     await message.answer(ADMIN_MESSAGE_INFO, reply_markup=keyboard)
-# 
-# @dp.message(AdminStates.waiting_for_admin_message)
-# async def send_to_admin(message: Message, state: FSMContext):
-#     user_id = message.from_user.id
-# 
-#     if message.text == "❌ Отмена":
-#         await state.clear()
-#         keyboard = ReplyKeyboardMarkup(
-#             keyboard=[
-#                 [KeyboardButton(text="ℹ Информация")],
-#                 [KeyboardButton(text="❓ Помощь")],
-#                 [KeyboardButton(text="📩 Написать админу")]
-#             ],
-#             resize_keyboard=True
-#         )
-#         await message.answer("❌ Отправка отменена", reply_markup=keyboard)
-#         return
-# 
-#     text = message.text
-#     if not text:
-#         await message.answer("❌ Напишите текст сообщения")
-#         return
-# 
-#     async with db_pool.acquire() as db:
-#         await db.execute(
-#             "INSERT INTO admin_messages (user_id, message, created_at) VALUES (?, ?, ?)",
-#             (user_id, text, datetime.utcnow().isoformat())
-#         )
-#         await db.commit()
-# 
-#     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-#         [
-#             InlineKeyboardButton(text="✅ Рассмотрено", callback_data=f"adminmsg_done_{user_id}"),
-#             InlineKeyboardButton(text="🔇 Мут", callback_data=f"adminmsg_mute_{user_id}")
-#         ],
-#         [
-#             InlineKeyboardButton(text="💬 Ответить", callback_data=f"adminmsg_reply_{user_id}")
-#         ]
-#     ])
-# 
-#     await bot.send_message(
-#         SUPER_ADMIN,
-#         f"📩 <b>Личное сообщение</b>\n\n"
-#         f"👤 ID: <code>{user_id}</code>\n"
-#         f"📛 Username: @{message.from_user.username or 'нет'}\n"
-#         f"📝 Имя: {message.from_user.first_name or 'нет'}\n\n"
-#         f"💬 <b>Сообщение:</b>\n{text}",
-#         reply_markup=keyboard
-#     )
-# 
-#     user_message_cooldown[user_id] = 1800
-# 
-#     keyboard_normal = ReplyKeyboardMarkup(
-#         keyboard=[
-#             [KeyboardButton(text="ℹ Информация")],
-#             [KeyboardButton(text="❓ Помощь")],
-#             [KeyboardButton(text="📩 Написать админу")]
-#         ],
-#         resize_keyboard=True
-#     )
-# 
-#     await message.answer("✅ Сообщение отправлено администрации. Ожидайте ответа.", reply_markup=keyboard_normal)
-#     await state.clear()
-# 
-# @dp.callback_query(F.data.startswith("adminmsg_done_"))
-# async def admin_message_done(callback: CallbackQuery):
-#     if callback.from_user.id != SUPER_ADMIN:
-#         return
-#     user_id = int(callback.data.split("_")[2])
-#     
-#     async with db_pool.acquire() as db:
-#         await db.execute(
-#             "UPDATE admin_messages SET status='reviewed' WHERE user_id=? AND status='new'",
-#             (user_id,)
-#         )
-#         await db.commit()
-#     
-#     await callback.message.edit_text(
-#         callback.message.text + "\n\n✅ <b>Рассмотрено</b>",
-#         reply_markup=None
-#     )
-#     await callback.answer()
-# 
-# @dp.callback_query(F.data.startswith("adminmsg_mute_"))
-# async def admin_message_mute(callback: CallbackQuery, state: FSMContext):
-#     if callback.from_user.id != SUPER_ADMIN:
-#         return
-#     user_id = int(callback.data.split("_")[2])
-# 
-#     await state.update_data(mute_user_id=user_id)
-#     await state.set_state(AdminStates.waiting_for_mute_duration)
-# 
-#     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-#         [
-#             InlineKeyboardButton(text="1 час", callback_data="mute_1h"),
-#             InlineKeyboardButton(text="3 часа", callback_data="mute_3h"),
-#             InlineKeyboardButton(text="6 часов", callback_data="mute_6h")
-#         ],
-#         [
-#             InlineKeyboardButton(text="12 часов", callback_data="mute_12h"),
-#             InlineKeyboardButton(text="1 день", callback_data="mute_1d"),
-#             InlineKeyboardButton(text="3 дня", callback_data="mute_3d")
-#         ],
-#         [
-#             InlineKeyboardButton(text="7 дней", callback_data="mute_7d"),
-#             InlineKeyboardButton(text="30 дней", callback_data="mute_30d"),
-#             InlineKeyboardButton(text="❌ Отмена", callback_data="mute_cancel")
-#         ]
-#     ])
-# 
-#     await callback.message.answer(
-#         f"⏳ Выберите длительность мута для пользователя {user_id}:",
-#         reply_markup=keyboard
-#     )
-#     await callback.answer()
 
 # ================= АДМИНСКИЕ КНОПКИ =================
 
@@ -1394,7 +1324,9 @@ async def admin_pending_messages(message: Message):
         
         warning_str = f" {' '.join(warnings)}" if warnings else ""
         
-        display_text = short_text.replace('\n', ' ').strip() if short_text else "без текста"
+        # Очищаем текст от HTML-тегов для безопасного отображения
+        clean_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
+        display_text = clean_text.replace('\n', ' ').strip() if clean_text else "без текста"
         if len(display_text) > 30:
             display_text = display_text[:30] + "..."
         
@@ -1511,7 +1443,7 @@ async def blacklist_menu(message: Message):
     if words:
         text += "Первые 20 слов:\n"
         for i, word in enumerate(words, 1):
-            text += f"{i}. <code>{word}</code>\n"
+            text += f"{i}. <code>{escape_html(word)}</code>\n"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить слово", callback_data="blacklist_add")],
@@ -1553,7 +1485,7 @@ async def blacklist_show(callback: CallbackQuery):
         return
     text = "📝 <b>Полный черный список</b>\n\n"
     for i, word in enumerate(words, 1):
-        text += f"{i}. <code>{word}</code>\n"
+        text += f"{i}. <code>{escape_html(word)}</code>\n"
         if i % 50 == 0:
             await callback.message.answer(text)
             text = ""
@@ -1588,11 +1520,11 @@ async def process_blacklist_add(message: Message, state: FSMContext):
             await db.commit()
         
         blacklist_cache[word] = True
-        await message.answer(f"✅ Слово <code>{word}</code> добавлено в черный список")
+        await message.answer(f"✅ Слово <code>{escape_html(word)}</code> добавлено в черный список")
         await log_admin_action(message.from_user.id, "blacklist_add", details=word)
         
     except aiosqlite.IntegrityError:
-        await message.answer(f"❌ Слово <code>{word}</code> уже есть в черном списке")
+        await message.answer(f"❌ Слово <code>{escape_html(word)}</code> уже есть в черном списке")
     except Exception as e:
         logger.error(f"Error adding to blacklist: {e}")
         await message.answer("❌ Ошибка при добавлении слова")
@@ -1623,10 +1555,10 @@ async def process_blacklist_remove(message: Message, state: FSMContext):
             if cursor.rowcount > 0:
                 if word in blacklist_cache:
                     del blacklist_cache[word]
-                await message.answer(f"✅ Слово <code>{word}</code> удалено из черного списка")
+                await message.answer(f"✅ Слово <code>{escape_html(word)}</code> удалено из черного списка")
                 await log_admin_action(message.from_user.id, "blacklist_remove", details=word)
             else:
-                await message.answer(f"❌ Слово <code>{word}</code> не найдено в черном списке")
+                await message.answer(f"❌ Слово <code>{escape_html(word)}</code> не найдено в черном списке")
         
     except Exception as e:
         logger.error(f"Error removing from blacklist: {e}")
@@ -2203,8 +2135,6 @@ async def handle_user_media(message: Message, state: FSMContext):
             media_file_id = None
             text = message.caption if message.caption else message.text
             
-            formatted_text = f"<blockquote>{text}</blockquote>" if text else None
-            
             if message.photo:
                 media_type = "photo"
                 media_file_id = message.photo[-1].file_id
@@ -2227,12 +2157,12 @@ async def handle_user_media(message: Message, state: FSMContext):
                     last_message=excluded.last_message
             """, (user_id, message.from_user.username, message.from_user.first_name, now.isoformat()))
 
-            # Сохраняем сообщение
+            # Сохраняем сообщение (чистый текст, без HTML)
             cursor = await db.execute("""
                 INSERT INTO messages 
                 (user_id, text, media_type, media_file_id, created_at, has_links, insult_count) 
                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
-            """, (user_id, formatted_text or text, media_type, media_file_id, now.isoformat(), has_links_flag, insult_count))
+            """, (user_id, text, media_type, media_file_id, now.isoformat(), has_links_flag, insult_count))
             
             row = await cursor.fetchone()
             msg_id = row[0]
@@ -2275,7 +2205,9 @@ async def handle_user_media(message: Message, state: FSMContext):
         warnings.append("🚫 МЕДИА")
     
     warning_text = f"\n\n⚠️ {' | '.join(warnings)}" if warnings else ""
-    display_text = formatted_text if formatted_text else (text or "без текста")
+    
+    # Экранируем текст для безопасного отображения
+    display_text = escape_html(text) if text else "без текста"
 
     tasks = []
     for admin in ADMINS:
@@ -2305,7 +2237,7 @@ async def handle_user_media(message: Message, state: FSMContext):
                 tasks.append(
                     bot.send_message(
                         admin,
-                        f"📨 <b>Новое сообщение</b>{warning_text}\n\n{display_text}\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
+                        f"📨 <b>Новое сообщение</b>{warning_text}\n\n<blockquote>{display_text}</blockquote>\n\n🆔 <code>{user_id}</code>\n👤 @{message.from_user.username or 'нет'}",
                         reply_markup=keyboard,
                         parse_mode=ParseMode.HTML
                     )
@@ -2336,7 +2268,7 @@ async def handle_user_media(message: Message, state: FSMContext):
                 tasks.append(
                     bot.send_message(
                         admin,
-                        f"📨 <b>Новое сообщение</b>{warning_text}\n\n{display_text}",
+                        f"📨 <b>Новое сообщение</b>{warning_text}\n\n<blockquote>{display_text}</blockquote>",
                         reply_markup=keyboard,
                         parse_mode=ParseMode.HTML
                     )
@@ -2352,13 +2284,10 @@ async def handle_user_media(message: Message, state: FSMContext):
             except Exception as e:
                 logger.error(f"Error sending to admin: {e}")
 
-# ================= ОТВЕТЫ НА СООБЩЕНИЯ =================
-
-# Словарь для временного хранения ответов
-reply_storage = {}  # {admin_id: {"user_id": int, "msg_id": int, "type": str}}
+# ================= ОТВЕТЫ НА СООБЩЕНИЯ (через БД) =================
 
 @dp.callback_query(F.data.startswith("reply_"))
-async def reply_to_message(callback: CallbackQuery):
+async def reply_to_message(callback: CallbackQuery, state: FSMContext):
     """Начать ответ на сообщение"""
     if callback.from_user.id not in ADMINS:
         return
@@ -2378,13 +2307,20 @@ async def reply_to_message(callback: CallbackQuery):
 
     user_id = result[0]
     
-    # Сохраняем в отдельный словарь
-    reply_storage[callback.from_user.id] = {
-        "user_id": user_id,
-        "msg_id": msg_id,
-        "type": "message"
-    }
+    # Сохраняем состояние ответа в БД
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO reply_states (admin_id, user_id, msg_id, reply_type, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (callback.from_user.id, user_id, msg_id, "message", datetime.utcnow().isoformat()))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Error saving reply state: {e}")
+        await callback.answer("❌ Ошибка сохранения состояния")
+        return
     
+    await state.set_state(AdminStates.waiting_for_reply_text)
     await callback.message.answer(
         f"📝 Введите текст ответа для пользователя <code>{user_id}</code>\n"
         f"(или отправьте /cancel для отмены)"
@@ -2393,19 +2329,27 @@ async def reply_to_message(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("adminmsg_reply_"))
-async def admin_message_reply(callback: CallbackQuery):
+async def admin_message_reply(callback: CallbackQuery, state: FSMContext):
     """Ответ на личное сообщение"""
     if callback.from_user.id != SUPER_ADMIN:
         return
     
     user_id = int(callback.data.split("_")[2])
     
-    # Сохраняем в отдельный словарь
-    reply_storage[callback.from_user.id] = {
-        "user_id": user_id,
-        "type": "admin_message"
-    }
+    # Сохраняем состояние ответа в БД
+    try:
+        async with db_pool.acquire() as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO reply_states (admin_id, user_id, msg_id, reply_type, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (callback.from_user.id, user_id, None, "admin_message", datetime.utcnow().isoformat()))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Error saving reply state: {e}")
+        await callback.answer("❌ Ошибка сохранения состояния")
+        return
     
+    await state.set_state(AdminStates.waiting_for_reply_text)
     await callback.message.answer(
         f"📝 Введите текст ответа для пользователя <code>{user_id}</code>\n"
         f"(или отправьте /cancel для отмены)"
@@ -2413,27 +2357,57 @@ async def admin_message_reply(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.message()
-async def handle_reply_input(message: Message):
+@dp.message(AdminStates.waiting_for_reply_text)
+async def handle_reply_input(message: Message, state: FSMContext):
     """Обрабатывает ввод ответа от админа"""
     
-    # Проверяем, есть ли админ в режиме ответа
-    if message.from_user.id not in reply_storage:
-        return  # Не в режиме ответа, пропускаем дальше к другим обработчикам
+    if message.from_user.id not in ADMINS:
+        await state.clear()
+        return
     
     # Проверка на отмену
     if message.text == "/cancel":
-        del reply_storage[message.from_user.id]
+        # Удаляем состояние из БД
+        try:
+            async with db_pool.acquire() as db:
+                await db.execute(
+                    "DELETE FROM reply_states WHERE admin_id=?",
+                    (message.from_user.id,)
+                )
+                await db.commit()
+        except:
+            pass
+        
+        await state.clear()
         await message.answer("❌ Ответ отменён")
         return
     
-    # Получаем данные
-    data = reply_storage[message.from_user.id]
-    user_id = data["user_id"]
-    
-    if not user_id:
-        del reply_storage[message.from_user.id]
-        await message.answer("❌ Ошибка: пользователь не найден")
+    # Получаем данные из БД
+    try:
+        async with db_pool.acquire() as db:
+            cursor = await db.execute(
+                "SELECT user_id, msg_id, reply_type FROM reply_states WHERE admin_id=?",
+                (message.from_user.id,)
+            )
+            result = await cursor.fetchone()
+            
+            if not result:
+                await state.clear()
+                await message.answer("❌ Ошибка: данные ответа не найдены")
+                return
+            
+            user_id, msg_id, reply_type = result
+            
+            # Удаляем состояние из БД
+            await db.execute(
+                "DELETE FROM reply_states WHERE admin_id=?",
+                (message.from_user.id,)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Error reading reply state: {e}")
+        await state.clear()
+        await message.answer("❌ Ошибка чтения данных")
         return
     
     # Отправляем ответ
@@ -2444,7 +2418,7 @@ async def handle_reply_input(message: Message):
         )
         
         # Если это ответ на личное сообщение, обновляем статус
-        if data.get("type") == "admin_message":
+        if reply_type == "admin_message":
             async with db_pool.acquire() as db:
                 await db.execute(
                     "UPDATE admin_messages SET status='replied' WHERE user_id=? AND status='new'",
@@ -2457,10 +2431,9 @@ async def handle_reply_input(message: Message):
         
     except Exception as e:
         logger.error(f"Reply error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка при отправке ответа: {e}")
     
-    # Удаляем из хранилища
-    del reply_storage[message.from_user.id]
+    await state.clear()
 
 # ================= ПРОСМОТР СООБЩЕНИЯ =================
 
@@ -2520,6 +2493,9 @@ async def review(callback: CallbackQuery):
 
     msg_cache[cache_key] = callback.from_user.id
 
+    # Экранируем текст для безопасного отображения
+    escaped_text = escape_html(text) if text else ""
+    
     # Создаем клавиатуру
     if media_type == "photo":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2622,27 +2598,57 @@ async def approve_with_watermark(callback: CallbackQuery):
             await callback.answer("❌ Водяной знак только для фото", show_alert=True)
             return
 
+        # Начинаем транзакцию
+        await db.execute("BEGIN TRANSACTION")
         try:
-            new_file_id = await add_watermark_to_photo(media_file_id)
-        except Exception as e:
-            logger.error(f"Watermark error: {e}")
-            await callback.answer("❌ Ошибка при наложении водяного знака", show_alert=True)
+            # Помечаем как "в обработке"
+            await db.execute(
+                "UPDATE messages SET status='processing' WHERE id=? AND status='pending'",
+                (msg_id,)
+            )
+            await db.commit()
+        except:
+            await db.execute("ROLLBACK")
+            await callback.answer("❌ Ошибка блокировки сообщения", show_alert=True)
             return
 
-        # Получаем стиль и счетчик
-        async with db_pool.acquire() as db2:
-            cursor = await db2.execute("SELECT value FROM settings WHERE key='post_style'")
-            style = (await cursor.fetchone())[0]
-            cursor = await db2.execute("SELECT value FROM settings WHERE key='post_counter'")
-            counter = int((await cursor.fetchone())[0]) + 1
-            await db2.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
-            
-            await db2.execute(
+    try:
+        new_file_id = await add_watermark_to_photo(media_file_id)
+    except Exception as e:
+        logger.error(f"Watermark error: {e}")
+        # Откатываем статус
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE messages SET status='pending', reviewer=NULL WHERE id=?",
+                (msg_id,)
+            )
+            await db.commit()
+        await callback.answer("❌ Ошибка при наложении водяного знака", show_alert=True)
+        return
+
+    # Получаем стиль и счетчик
+    async with db_pool.acquire() as db:
+        cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
+        style = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT value FROM settings WHERE key='post_counter'")
+        counter = int((await cursor.fetchone())[0]) + 1
+        
+        await db.execute("BEGIN TRANSACTION")
+        try:
+            await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
+            await db.execute(
                 "UPDATE messages SET status='approved', reviewed_at=? WHERE id=?",
                 (datetime.utcnow().isoformat(), msg_id)
             )
-            await db2.commit()
+            await db.commit()
+        except:
+            await db.execute("ROLLBACK")
+            await callback.answer("❌ Ошибка сохранения", show_alert=True)
+            return
 
+    # Экранируем текст
+    escaped_text = escape_html(text) if text else ""
+    
     # Форматируем пост
     if style == "1":
         header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
@@ -2655,18 +2661,29 @@ async def approve_with_watermark(callback: CallbackQuery):
         footer = f"\n\n—\n<a href='https://t.me/{BOT_USERNAME}'>✉ Ответить</a>"
 
     # Публикуем фото с водяным знаком
-    await bot.send_photo(
-        CHANNEL_ID,
-        photo=new_file_id,
-        caption=f"{header}{text or ''}{footer}",
-        parse_mode=ParseMode.HTML
-    )
+    try:
+        await bot.send_photo(
+            CHANNEL_ID,
+            photo=new_file_id,
+            caption=f"{header}{escaped_text}{footer}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Error publishing watermarked photo: {e}")
+        # Откатываем если не удалось опубликовать
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE messages SET status='processing', reviewed_at=NULL WHERE id=?",
+                (msg_id,)
+            )
+            await db.commit()
+        await callback.answer("❌ Ошибка публикации", show_alert=True)
+        return
 
     # Проверяем тип сообщения для редактирования
     center_status = " + фото-вставка" if os.path.exists("watermark_center.png") else ""
     
     try:
-        # Пытаемся отредактировать сообщение с кнопками
         if callback.message.photo or callback.message.video:
             await callback.message.edit_caption(
                 caption=callback.message.caption.replace("\n\n🔄 <b>Рассматривается...</b>", "") + f"\n\n✅ <b>ОПУБЛИКОВАНО С ВОДЯНЫМ ЗНАКОМ{center_status}</b>",
@@ -2678,7 +2695,6 @@ async def approve_with_watermark(callback: CallbackQuery):
                 reply_markup=None
             )
     except:
-        # Если не получилось отредактировать, просто удаляем старое сообщение и шлём новое
         try:
             await callback.message.delete()
         except:
@@ -2724,26 +2740,33 @@ async def confirm_skip(callback: CallbackQuery):
     
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT status FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
-            
-            if not result:
-                await callback.answer("❌ Сообщение не найдено", show_alert=True)
-                return
+            await db.execute("BEGIN TRANSACTION")
+            try:
+                cursor = await db.execute(
+                    "SELECT status FROM messages WHERE id=?",
+                    (msg_id,)
+                )
+                result = await cursor.fetchone()
                 
-            status = result[0]
-            if status != "pending":
-                await callback.answer(f"❌ Сообщение уже {status}", show_alert=True)
-                return
-            
-            await db.execute(
-                "UPDATE messages SET skipped=1, reviewer=NULL WHERE id=?",
-                (msg_id,)
-            )
-            await db.commit()
+                if not result:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("❌ Сообщение не найдено", show_alert=True)
+                    return
+                    
+                status = result[0]
+                if status != "pending":
+                    await db.execute("ROLLBACK")
+                    await callback.answer(f"❌ Сообщение уже {status}", show_alert=True)
+                    return
+                
+                await db.execute(
+                    "UPDATE messages SET skipped=1, reviewer=NULL WHERE id=?",
+                    (msg_id,)
+                )
+                await db.commit()
+            except:
+                await db.execute("ROLLBACK")
+                raise
     except Exception as e:
         logger.error(f"DB error in confirm_skip: {e}")
         await callback.answer("❌ Ошибка базы данных", show_alert=True)
@@ -2780,27 +2803,34 @@ async def cancel_review(callback: CallbackQuery):
 
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT reviewer, user_id, media_type FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
-            
-            if not result:
-                await callback.answer("Сообщение не найдено", show_alert=True)
-                return
+            await db.execute("BEGIN TRANSACTION")
+            try:
+                cursor = await db.execute(
+                    "SELECT reviewer, user_id, media_type FROM messages WHERE id=?",
+                    (msg_id,)
+                )
+                result = await cursor.fetchone()
                 
-            reviewer, user_id, media_type = result
+                if not result:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сообщение не найдено", show_alert=True)
+                    return
+                    
+                reviewer, user_id, media_type = result
 
-            if reviewer != callback.from_user.id:
-                await callback.answer("Вы не рассматриваете это сообщение", show_alert=True)
-                return
+                if reviewer != callback.from_user.id:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Вы не рассматриваете это сообщение", show_alert=True)
+                    return
 
-            await db.execute(
-                "UPDATE messages SET reviewer=NULL WHERE id=?",
-                (msg_id,)
-            )
-            await db.commit()
+                await db.execute(
+                    "UPDATE messages SET reviewer=NULL WHERE id=?",
+                    (msg_id,)
+                )
+                await db.commit()
+            except:
+                await db.execute("ROLLBACK")
+                raise
     except Exception as e:
         logger.error(f"DB error in cancel_review: {e}")
         await callback.answer("❌ Ошибка базы данных", show_alert=True)
@@ -2821,7 +2851,6 @@ async def cancel_review(callback: CallbackQuery):
     for admin in ADMINS:
         if admin != callback.from_user.id:
             try:
-                # Для обычных админов не показываем user_id
                 if admin == SUPER_ADMIN:
                     await bot.send_message(
                         admin,
@@ -2867,31 +2896,39 @@ async def approve(callback: CallbackQuery):
 
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT text, user_id, reviewer, media_type, media_file_id FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
+            await db.execute("BEGIN TRANSACTION")
+            try:
+                cursor = await db.execute(
+                    "SELECT text, user_id, reviewer, media_type, media_file_id FROM messages WHERE id=?",
+                    (msg_id,)
+                )
+                result = await cursor.fetchone()
 
-            if not result:
-                await callback.answer("Сообщение не найдено", show_alert=True)
-                return
+                if not result:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сообщение не найдено", show_alert=True)
+                    return
 
-            text, user_id, reviewer, media_type, media_file_id = result
+                text, user_id, reviewer, media_type, media_file_id = result
 
-            if reviewer != callback.from_user.id:
-                await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
-                return
+                if reviewer != callback.from_user.id:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
+                    return
 
-            await db.execute(
-                "UPDATE messages SET status='approved', reviewed_at=? WHERE id=?",
-                (datetime.utcnow().isoformat(), msg_id)
-            )
+                # Помечаем как "в обработке"
+                await db.execute(
+                    "UPDATE messages SET status='processing', reviewed_at=? WHERE id=? AND status='pending'",
+                    (datetime.utcnow().isoformat(), msg_id)
+                )
 
-            cursor = await db.execute("SELECT value FROM settings WHERE key='post_counter'")
-            counter = int((await cursor.fetchone())[0]) + 1
-            await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
-            await db.commit()
+                cursor = await db.execute("SELECT value FROM settings WHERE key='post_counter'")
+                counter = int((await cursor.fetchone())[0]) + 1
+                await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
+                await db.commit()
+            except:
+                await db.execute("ROLLBACK")
+                raise
     except Exception as e:
         logger.error(f"DB error in approve: {e}")
         await callback.answer("❌ Ошибка базы данных", show_alert=True)
@@ -2908,6 +2945,9 @@ async def approve(callback: CallbackQuery):
         cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
         style = (await cursor.fetchone())[0]
 
+    # Экранируем текст
+    escaped_text = escape_html(text) if text else ""
+    
     if style == "1":
         header = f"💬 <b>Новое анонимное сообщение</b>\n\n"
         footer = f"\n\n━━━━━━━━━━━━━━\n✉ <a href='https://t.me/{BOT_USERNAME}'>Отправить сообщение</a>"
@@ -2920,28 +2960,46 @@ async def approve(callback: CallbackQuery):
 
     try:
         if media_type == "photo":
+            caption = f"{header}{escaped_text}{footer}" if escaped_text else f"{header}{footer}"
             await bot.send_photo(
                 CHANNEL_ID,
                 photo=media_file_id,
-                caption=f"{header}{text or ''}{footer}",
+                caption=caption,
                 parse_mode=ParseMode.HTML
             )
         elif media_type == "video":
+            caption = f"{header}{escaped_text}{footer}" if escaped_text else f"{header}{footer}"
             await bot.send_video(
                 CHANNEL_ID,
                 video=media_file_id,
-                caption=f"{header}{text or ''}{footer}",
+                caption=caption,
                 parse_mode=ParseMode.HTML
             )
         else:
             await bot.send_message(
                 CHANNEL_ID,
-                f"{header}{text or ''}{footer}",
+                f"{header}<blockquote>{escaped_text}</blockquote>{footer}",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True
             )
+        
+        # Если успешно, обновляем статус
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE messages SET status='approved' WHERE id=?",
+                (msg_id,)
+            )
+            await db.commit()
+            
     except Exception as e:
         logger.error(f"PUBLISH ERROR: {e}")
+        # Откатываем статус
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE messages SET status='processing', reviewed_at=NULL WHERE id=?",
+                (msg_id,)
+            )
+            await db.commit()
         await callback.answer("❌ Ошибка при публикации", show_alert=True)
         return
 
@@ -2983,27 +3041,34 @@ async def reject(callback: CallbackQuery):
 
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT user_id, reviewer, media_type FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
+            await db.execute("BEGIN TRANSACTION")
+            try:
+                cursor = await db.execute(
+                    "SELECT user_id, reviewer, media_type FROM messages WHERE id=?",
+                    (msg_id,)
+                )
+                result = await cursor.fetchone()
 
-            if not result:
-                await callback.answer("Сообщение не найдено", show_alert=True)
-                return
+                if not result:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сообщение не найдено", show_alert=True)
+                    return
 
-            user_id, reviewer, media_type = result
+                user_id, reviewer, media_type = result
 
-            if reviewer != callback.from_user.id:
-                await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
-                return
+                if reviewer != callback.from_user.id:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
+                    return
 
-            await db.execute(
-                "UPDATE messages SET status='rejected', reviewed_at=? WHERE id=?",
-                (datetime.utcnow().isoformat(), msg_id)
-            )
-            await db.commit()
+                await db.execute(
+                    "UPDATE messages SET status='rejected', reviewed_at=? WHERE id=?",
+                    (datetime.utcnow().isoformat(), msg_id)
+                )
+                await db.commit()
+            except:
+                await db.execute("ROLLBACK")
+                raise
     except Exception as e:
         logger.error(f"DB error in reject: {e}")
         await callback.answer("❌ Ошибка базы данных", show_alert=True)
@@ -3048,33 +3113,40 @@ async def mute(callback: CallbackQuery):
 
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT user_id, reviewer, media_type FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
+            await db.execute("BEGIN TRANSACTION")
+            try:
+                cursor = await db.execute(
+                    "SELECT user_id, reviewer, media_type FROM messages WHERE id=?",
+                    (msg_id,)
+                )
+                result = await cursor.fetchone()
 
-            if not result:
-                await callback.answer("Сообщение не найдено", show_alert=True)
-                return
+                if not result:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сообщение не найдено", show_alert=True)
+                    return
 
-            user_id, reviewer, media_type = result
+                user_id, reviewer, media_type = result
 
-            if reviewer != callback.from_user.id:
-                await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
-                return
+                if reviewer != callback.from_user.id:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
+                    return
 
-            mute_until = datetime.utcnow() + timedelta(days=7)
+                mute_until = datetime.utcnow() + timedelta(days=7)
 
-            await db.execute(
-                "UPDATE users SET mute_until=? WHERE user_id=?",
-                (mute_until.isoformat(), user_id)
-            )
-            await db.execute(
-                "UPDATE messages SET status='muted', reviewed_at=? WHERE id=?",
-                (datetime.utcnow().isoformat(), msg_id)
-            )
-            await db.commit()
+                await db.execute(
+                    "UPDATE users SET mute_until=? WHERE user_id=?",
+                    (mute_until.isoformat(), user_id)
+                )
+                await db.execute(
+                    "UPDATE messages SET status='muted', reviewed_at=? WHERE id=?",
+                    (datetime.utcnow().isoformat(), msg_id)
+                )
+                await db.commit()
+            except:
+                await db.execute("ROLLBACK")
+                raise
     except Exception as e:
         logger.error(f"DB error in mute: {e}")
         await callback.answer("❌ Ошибка базы данных", show_alert=True)
@@ -3121,49 +3193,56 @@ async def ban(callback: CallbackQuery):
 
     try:
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT user_id, reviewer, media_type FROM messages WHERE id=?",
-                (msg_id,)
-            )
-            result = await cursor.fetchone()
+            await db.execute("BEGIN TRANSACTION")
+            try:
+                cursor = await db.execute(
+                    "SELECT user_id, reviewer, media_type FROM messages WHERE id=?",
+                    (msg_id,)
+                )
+                result = await cursor.fetchone()
 
-            if not result:
-                await callback.answer("Сообщение не найдено", show_alert=True)
-                return
+                if not result:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сообщение не найдено", show_alert=True)
+                    return
 
-            user_id, reviewer, media_type = result
+                user_id, reviewer, media_type = result
 
-            if reviewer != callback.from_user.id:
-                await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
-                return
+                if reviewer != callback.from_user.id:
+                    await db.execute("ROLLBACK")
+                    await callback.answer("Сначала нужно начать рассмотрение", show_alert=True)
+                    return
 
-            if callback.from_user.id != SUPER_ADMIN:
+                if callback.from_user.id != SUPER_ADMIN:
+                    await db.execute(
+                        "INSERT INTO ban_requests(target_id, admin_id, message_id, created_at) VALUES(?,?,?,?)",
+                        (user_id, callback.from_user.id, msg_id, datetime.utcnow().isoformat())
+                    )
+                    await db.commit()
+
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Подтвердить бан", callback_data=f"confirmban_{user_id}"),
+                         InlineKeyboardButton(text="❌ Отмена", callback_data="cancelban")]
+                    ])
+
+                    await bot.send_message(
+                        SUPER_ADMIN,
+                        f"⚠ Запрос на бан пользователя {user_id}\nОт админа: @{callback.from_user.username or callback.from_user.first_name}\nСообщение: #{msg_id}",
+                        reply_markup=keyboard
+                    )
+
+                    await callback.answer("Запрос отправлен главному админу.")
+                    return
+
+                await db.execute("UPDATE users SET banned=1 WHERE user_id=?", (user_id,))
                 await db.execute(
-                    "INSERT INTO ban_requests(target_id, admin_id, message_id, created_at) VALUES(?,?,?,?)",
-                    (user_id, callback.from_user.id, msg_id, datetime.utcnow().isoformat())
+                    "UPDATE messages SET status='banned', reviewed_at=? WHERE id=?",
+                    (datetime.utcnow().isoformat(), msg_id)
                 )
                 await db.commit()
-
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Подтвердить бан", callback_data=f"confirmban_{user_id}"),
-                     InlineKeyboardButton(text="❌ Отмена", callback_data="cancelban")]
-                ])
-
-                await bot.send_message(
-                    SUPER_ADMIN,
-                    f"⚠ Запрос на бан пользователя {user_id}\nОт админа: @{callback.from_user.username or callback.from_user.first_name}\nСообщение: #{msg_id}",
-                    reply_markup=keyboard
-                )
-
-                await callback.answer("Запрос отправлен главному админу.")
-                return
-
-            await db.execute("UPDATE users SET banned=1 WHERE user_id=?", (user_id,))
-            await db.execute(
-                "UPDATE messages SET status='banned', reviewed_at=? WHERE id=?",
-                (datetime.utcnow().isoformat(), msg_id)
-            )
-            await db.commit()
+            except:
+                await db.execute("ROLLBACK")
+                raise
     except Exception as e:
         logger.error(f"DB error in ban: {e}")
         await callback.answer("❌ Ошибка базы данных", show_alert=True)
@@ -3331,11 +3410,12 @@ async def refresh_pending(callback: CallbackQuery):
         
         warning_str = f" {' '.join(warnings)}" if warnings else ""
         
-        display_text = short_text.replace('\n', ' ').strip() if short_text else "без текста"
+        # Очищаем текст от HTML-тегов
+        clean_text = re.sub(r'<[^>]+>', '', short_text) if short_text else ""
+        display_text = clean_text.replace('\n', ' ').strip() if clean_text else "без текста"
         if len(display_text) > 30:
             display_text = display_text[:30] + "..."
         
-        # Для SUPER_ADMIN показываем ID
         if callback.from_user.id == SUPER_ADMIN:
             text += f"{emoji} #{msg_id}{warning_str} | {date_str}\n"
             text += f"👤 ID: {user_id}\n"
@@ -3444,7 +3524,6 @@ async def process_add_exception(message: Message, state: FSMContext):
             )
             await db.commit()
             
-            # Обновляем кэш
             maintenance_exceptions.add(user_id)
             
         await message.answer(f"✅ Пользователь {user_id} добавлен в исключение")
@@ -3482,7 +3561,6 @@ async def process_remove_exception(message: Message, state: FSMContext):
             )
             await db.commit()
             
-            # Обновляем кэш
             if user_id in maintenance_exceptions:
                 maintenance_exceptions.remove(user_id)
             
@@ -3505,11 +3583,9 @@ async def run_http_server():
         from datetime import timedelta
         
         async def handle(request):
-            # Считаем аптайм
             uptime_seconds = time.time() - start_time
             uptime_str = str(timedelta(seconds=int(uptime_seconds)))
             
-            # Собираем статистику из БД
             try:
                 async with db_pool.acquire() as db:
                     cursor = await db.execute("SELECT COUNT(*) FROM messages WHERE status='pending'")
@@ -3555,8 +3631,6 @@ async def run_http_server():
         await site.start()
         
         logger.info(f"🌐 Advanced HTTP server started on port {port}")
-        logger.info(f"📊 Status page: http://localhost:{port}/status")
-        logger.info(f"🔗 Public URL: /health, /ping, /status, /stats")
         
     except Exception as e:
         logger.error(f"Failed to start HTTP server: {e}")
@@ -3565,7 +3639,7 @@ async def main():
     global night_mode_enabled, auto_mode_enabled, maintenance_mode, shutdown_flag
     
     logger.info("=" * 50)
-    logger.info("BOT STARTING ON RAILWAY...")
+    logger.info("BOT STARTING...")
     
     await init_db()
     
@@ -3591,12 +3665,10 @@ async def main():
     asyncio.create_task(auto_post_messages())
     asyncio.create_task(check_long_pending_messages())
     asyncio.create_task(heartbeat())
-    
-    # Запускаем HTTP-сервер
     asyncio.create_task(run_http_server())
     
     logger.info("=" * 50)
-    logger.info(f"🤖 Бот запущен на Railway!")
+    logger.info(f"🤖 Бот запущен!")
     logger.info(f"👑 SUPER_ADMIN: {SUPER_ADMIN}")
     logger.info(f"👥 ADMINS: {ADMINS}")
     logger.info(f"🌙 Ночной режим: {'✅' if night_mode_enabled else '❌'}")
@@ -3604,12 +3676,10 @@ async def main():
     logger.info(f"🛠 Техработы: {'✅' if maintenance_mode else '❌'}")
     logger.info(f"📚 Черный список: {len(blacklist_cache)} слов")
     
-    # Проверяем наличие файла с центральным водяным знаком
     if os.path.exists("watermark_center.png"):
         logger.info("🖼 Центральный водяной знак: watermark_center.png найден")
     else:
-        logger.warning("🖼 Центральный водяной знак не найден. Будет использован только текстовый водяной знак.")
-        logger.warning("   Поместите файл watermark_center.png в папку с ботом для активации фото-вставки.")
+        logger.warning("🖼 Центральный водяной знак не найден.")
     
     logger.info("=" * 50)
     
