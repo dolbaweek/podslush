@@ -2229,7 +2229,11 @@ async def set_style(callback: CallbackQuery):
 # ================= КАПЧА ДЛЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ =================
 
 async def check_user_captcha(user_id: int) -> bool:
-    """Проверяет, прошел ли пользователь капчу"""
+    """Проверяет, прошел ли пользователь капчу.
+    Админы автоматически считаются прошедшими."""
+    if user_id in ADMINS:
+        return True
+    
     try:
         async with db_pool.acquire() as db:
             cursor = await db.execute(
@@ -2241,31 +2245,19 @@ async def check_user_captcha(user_id: int) -> bool:
     except:
         return False
 
-async def set_captcha_passed(user_id: int):
-    """Отмечает, что пользователь прошел капчу"""
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute(
-                "UPDATE users SET captcha_passed=1 WHERE user_id=?",
-                (user_id,)
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error(f"Error setting captcha passed: {e}")
-
 # ================= ОБРАБОТЧИК СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ =================
 
 @dp.message(F.photo | F.video | F.text)
 async def handle_user_media(message: Message, state: FSMContext):
     """Обработка сообщений от обычных пользователей"""
     
-    # Пропускаем админов
+    # Пропускаем админов (они не проходят капчу)
     if message.from_user.id in ADMINS:
         return
 
-    # Проверяем, не в состоянии ли FSM
+    # Проверяем, не в состоянии ли FSM (кроме капчи)
     current_state = await state.get_state()
-    if current_state is not None:
+    if current_state is not None and current_state != "AdminStates:waiting_for_faq_question":
         return
 
     # Игнорируем команды и кнопки меню
@@ -2296,16 +2288,39 @@ async def handle_user_media(message: Message, state: FSMContext):
 
     # Проверяем капчу
     if not await check_user_captcha(user_id):
-        question, answer = generate_captcha()
-        captcha_cache[user_id] = answer
-        
-        await message.answer(
-            "🤖 <b>Проверка на бота</b>\n\n"
-            f"Решите пример: <b>{question} = ?</b>\n\n"
-            "Отправьте ответ числом.\n"
-            "Это нужно сделать один раз."
-        )
-        return
+        # Если пользователь в кэше капчи - проверяем ответ
+        if user_id in captcha_cache:
+            if message.text and message.text.strip() == captcha_cache[user_id]:
+                # Правильный ответ!
+                await set_captcha_passed(user_id)
+                del captcha_cache[user_id]
+                await message.answer(
+                    "✅ Проверка пройдена! Теперь вы можете отправлять сообщения.\n\n"
+                    "Отправьте текст, фото или видео для публикации."
+                )
+                return
+            else:
+                # Неправильный ответ - генерируем новую капчу
+                question, answer = generate_captcha()
+                captcha_cache[user_id] = answer
+                await message.answer(
+                    "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
+                    f"<b>{question} = ?</b>\n\n"
+                    "Отправьте только число."
+                )
+                return
+        else:
+            # Первый раз - генерируем капчу
+            question, answer = generate_captcha()
+            captcha_cache[user_id] = answer
+            
+            await message.answer(
+                "🤖 <b>Проверка на бота</b>\n\n"
+                f"Решите пример: <b>{question} = ?</b>\n\n"
+                "Отправьте только число в ответном сообщении.\n"
+                "Это нужно сделать один раз."
+            )
+            return
     
     now = datetime.utcnow()
 
