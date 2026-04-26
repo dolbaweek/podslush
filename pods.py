@@ -4396,6 +4396,8 @@ async def run_http_server():
     try:
         from aiohttp import web
         
+        # ==================== HEALTH CHECK ====================
+        
         async def handle(request):
             uptime_seconds = time.time() - start_time
             uptime_str = str(timedelta(seconds=int(uptime_seconds)))
@@ -4427,12 +4429,10 @@ async def run_http_server():
                 "timestamp": datetime.utcnow().isoformat()
             })
         
+        # ==================== API: ДАШБОРД ====================
+        
         async def api_dashboard(request):
             """API для дашборда Web App"""
-            auth_header = request.headers.get('X-Telegram-Auth')
-            if not auth_header:
-                return web.json_response({"error": "Unauthorized"}, status=401)
-            
             try:
                 async with db_pool.acquire() as db:
                     cursor = await db.execute("""
@@ -4449,7 +4449,7 @@ async def run_http_server():
                         SELECT admin_id, action, target_id, created_at
                         FROM admin_actions
                         ORDER BY created_at DESC
-                        LIMIT 10
+                        LIMIT 20
                     """)
                     recent_actions = await cursor.fetchall()
                     
@@ -4478,26 +4478,38 @@ async def run_http_server():
                 logger.error(f"API dashboard error: {e}")
                 return web.json_response({"error": str(e)}, status=500)
         
+        # ==================== API: ОЧЕРЕДЬ МОДЕРАЦИИ ====================
+        
         async def api_pending_messages(request):
             """API для получения очереди сообщений"""
             try:
                 async with db_pool.acquire() as db:
                     cursor = await db.execute("""
-                        SELECT id, media_type, substr(text, 1, 100) as preview, created_at, has_links, insult_count
+                        SELECT id, media_type, substr(text, 1, 200) as preview, 
+                               created_at, has_links, insult_count, poll_data
                         FROM messages
                         WHERE status='pending' AND skipped=0
                         ORDER BY created_at DESC
-                        LIMIT 20
+                        LIMIT 50
                     """)
                     messages = await cursor.fetchall()
                     
                     result = []
                     for msg in messages:
                         clean_text = re.sub(r'<[^>]+>', '', msg[2]) if msg[2] else ""
+                        
+                        msg_type = "text"
+                        if msg[1] == "photo":
+                            msg_type = "photo"
+                        elif msg[1] == "video":
+                            msg_type = "video"
+                        elif msg[6]:  # poll_data
+                            msg_type = "poll"
+                        
                         result.append({
                             "id": msg[0],
-                            "type": msg[1] or "text",
-                            "preview": clean_text[:100],
+                            "type": msg_type,
+                            "preview": clean_text[:200],
                             "created_at": msg[3],
                             "has_links": bool(msg[4]),
                             "insult_count": msg[5] or 0
@@ -4505,7 +4517,10 @@ async def run_http_server():
                     
                     return web.json_response({"messages": result})
             except Exception as e:
+                logger.error(f"API pending error: {e}")
                 return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: ОДОБРИТЬ ====================
         
         async def api_approve(request):
             """API для одобрения сообщения"""
@@ -4517,18 +4532,44 @@ async def run_http_server():
                 async with db_pool.acquire() as db:
                     await db.execute("BEGIN TRANSACTION")
                     try:
+                        cursor = await db.execute(
+                            "SELECT text, user_id, media_type, media_file_id, poll_data FROM messages WHERE id=?",
+                            (msg_id,)
+                        )
+                        msg = await cursor.fetchone()
+                        
+                        if not msg:
+                            await db.execute("ROLLBACK")
+                            return web.json_response({"error": "Сообщение не найдено"}, status=404)
+                        
+                        text, user_id, media_type, media_file_id, poll_data = msg
+                        
+                        # Помечаем как одобренное
                         await db.execute(
                             "UPDATE messages SET status='approved', reviewed_at=?, reviewer=? WHERE id=?",
                             (datetime.utcnow().isoformat(), admin_id, msg_id)
                         )
+                        
+                        # Обновляем счетчик
+                        cursor = await db.execute("SELECT value FROM settings WHERE key='post_counter'")
+                        counter = int((await cursor.fetchone())[0]) + 1
+                        await db.execute("UPDATE settings SET value=? WHERE key='post_counter'", (str(counter),))
+                        
                         await db.commit()
-                    except:
+                        
+                        await log_admin_action(admin_id, "approve", target_id=msg_id, details=f"web post #{counter}")
+                        
+                    except Exception as e:
                         await db.execute("ROLLBACK")
-                        raise
+                        raise e
                 
-                return web.json_response({"success": True})
+                return web.json_response({"success": True, "post_number": counter})
+                
             except Exception as e:
+                logger.error(f"API approve error: {e}")
                 return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: ОТКЛОНИТЬ ====================
         
         async def api_reject(request):
             """API для отклонения сообщения"""
@@ -4543,10 +4584,211 @@ async def run_http_server():
                         (datetime.utcnow().isoformat(), admin_id, msg_id)
                     )
                     await db.commit()
+                    
+                    await log_admin_action(admin_id, "reject", target_id=msg_id, details="web")
+                
+                return web.json_response({"success": True})
+            except Exception as e:
+                logger.error(f"API reject error: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: ПРОПУСТИТЬ ====================
+        
+        async def api_skip(request):
+            """API для пропуска сообщения"""
+            try:
+                data = await request.json()
+                msg_id = data.get('msg_id')
+                admin_id = data.get('admin_id')
+                
+                async with db_pool.acquire() as db:
+                    await db.execute(
+                        "UPDATE messages SET skipped=1, reviewer=? WHERE id=?",
+                        (admin_id, msg_id)
+                    )
+                    await db.commit()
+                    
+                    await log_admin_action(admin_id, "skip", target_id=msg_id, details="web")
+                
+                return web.json_response({"success": True})
+            except Exception as e:
+                logger.error(f"API skip error: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: МУТ ====================
+        
+        async def api_mute_user(request):
+            """API для мута пользователя"""
+            try:
+                data = await request.json()
+                user_id = data.get('user_id')
+                admin_id = data.get('admin_id')
+                days = data.get('days', 7)
+                
+                mute_until = datetime.utcnow() + timedelta(days=days)
+                
+                async with db_pool.acquire() as db:
+                    await db.execute(
+                        "UPDATE users SET mute_until=? WHERE user_id=?",
+                        (mute_until.isoformat(), user_id)
+                    )
+                    await db.commit()
+                    
+                    if user_id in user_cache:
+                        del user_cache[user_id]
+                    
+                    await log_admin_action(admin_id, "mute", target_id=user_id, details=f"web {days}d")
+                
+                return web.json_response({"success": True, "mute_until": mute_until.isoformat()})
+            except Exception as e:
+                logger.error(f"API mute error: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: ПОИСК ПОЛЬЗОВАТЕЛЕЙ ====================
+        
+        async def api_user_search(request):
+            """API для поиска пользователей"""
+            try:
+                query = request.query.get('q', '')
+                
+                async with db_pool.acquire() as db:
+                    cursor = await db.execute("""
+                        SELECT user_id, username, first_name, banned, mute_until, 
+                               maintenance_exception, captcha_passed
+                        FROM users 
+                        WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ?
+                        LIMIT 10
+                    """, (f"%{query}%", f"%{query}%", f"%{query}%"))
+                    users = await cursor.fetchall()
+                    
+                    result = []
+                    for user in users:
+                        result.append({
+                            "user_id": user[0],
+                            "username": user[1],
+                            "first_name": user[2],
+                            "banned": bool(user[3]),
+                            "mute_until": user[4],
+                            "maintenance_exception": bool(user[5]),
+                            "captcha_passed": bool(user[6])
+                        })
+                    
+                    return web.json_response({"users": result})
+            except Exception as e:
+                logger.error(f"API user search error: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: СПИСОК ЗАБАНЕННЫХ ====================
+        
+        async def api_banned_users(request):
+            """API для списка забаненных"""
+            try:
+                async with db_pool.acquire() as db:
+                    cursor = await db.execute(
+                        "SELECT user_id, username, first_name FROM users WHERE banned=1 LIMIT 50"
+                    )
+                    users = await cursor.fetchall()
+                    
+                    result = [{"user_id": u[0], "username": u[1], "first_name": u[2]} for u in users]
+                    return web.json_response({"users": result})
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: СПИСОК ЗАМУЧЕННЫХ ====================
+        
+        async def api_muted_users(request):
+            """API для списка замученных"""
+            try:
+                async with db_pool.acquire() as db:
+                    cursor = await db.execute("""
+                        SELECT user_id, username, first_name, mute_until 
+                        FROM users 
+                        WHERE mute_until > datetime('now') 
+                        LIMIT 50
+                    """)
+                    users = await cursor.fetchall()
+                    
+                    result = [{
+                        "user_id": u[0], 
+                        "username": u[1], 
+                        "first_name": u[2],
+                        "mute_until": u[3]
+                    } for u in users]
+                    return web.json_response({"users": result})
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: ПРОВЕРКА РОЛИ ====================
+        
+        async def api_check_role(request):
+            """API для проверки роли админа"""
+            try:
+                user_id = request.query.get('user_id', '0')
+                user_id = int(user_id)
+                
+                is_super = user_id == SUPER_ADMIN
+                is_admin = user_id in ADMINS
+                
+                return web.json_response({
+                    "is_admin": is_admin,
+                    "is_super_admin": is_super,
+                    "user_id": user_id
+                })
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: БАН ====================
+        
+        async def api_ban_user(request):
+            """API для бана пользователя"""
+            try:
+                data = await request.json()
+                user_id = data.get('user_id')
+                admin_id = data.get('admin_id')
+                
+                # Только супер-админ может банить
+                if admin_id != SUPER_ADMIN:
+                    return web.json_response({"error": "Только супер-админ"}, status=403)
+                
+                async with db_pool.acquire() as db:
+                    await db.execute("UPDATE users SET banned=1 WHERE user_id=?", (user_id,))
+                    await db.commit()
+                    
+                    if user_id in user_cache:
+                        del user_cache[user_id]
+                    
+                    await log_admin_action(admin_id, "ban", target_id=user_id, details="web")
                 
                 return web.json_response({"success": True})
             except Exception as e:
                 return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: РАЗБАН ====================
+        
+        async def api_unban_user(request):
+            """API для разбана пользователя"""
+            try:
+                data = await request.json()
+                user_id = data.get('user_id')
+                admin_id = data.get('admin_id')
+                
+                if admin_id != SUPER_ADMIN:
+                    return web.json_response({"error": "Только супер-админ"}, status=403)
+                
+                async with db_pool.acquire() as db:
+                    await db.execute("UPDATE users SET banned=0 WHERE user_id=?", (user_id,))
+                    await db.commit()
+                    
+                    if user_id in user_cache:
+                        del user_cache[user_id]
+                    
+                    await log_admin_action(admin_id, "unban", target_id=user_id, details="web")
+                
+                return web.json_response({"success": True})
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== API: НАСТРОЙКИ ====================
         
         async def api_settings(request):
             """API для получения/изменения настроек"""
@@ -4562,7 +4804,7 @@ async def run_http_server():
                         
                         result['night_mode_enabled'] = night_mode_enabled
                         result['auto_mode_enabled'] = auto_mode_enabled
-                        result['maintenance'] = maintenance_mode
+                        result['maintenance'] = '1' if maintenance_mode else '0'
                         
                         return web.json_response(result)
                 except Exception as e:
@@ -4571,6 +4813,7 @@ async def run_http_server():
             elif request.method == 'POST':
                 try:
                     data = await request.json()
+                    global night_mode_enabled, auto_mode_enabled, maintenance_mode
                     
                     async with db_pool.acquire() as db:
                         for key, value in data.items():
@@ -4578,11 +4821,22 @@ async def run_http_server():
                                 "UPDATE settings SET value=? WHERE key=?",
                                 (str(value), key)
                             )
+                            
+                            # Обновляем глобальные флаги
+                            if key == 'night_mode':
+                                night_mode_enabled = value == '1'
+                            elif key == 'auto_mode':
+                                auto_mode_enabled = value == '1'
+                            elif key == 'maintenance':
+                                maintenance_mode = value == '1'
+                        
                         await db.commit()
                     
                     return web.json_response({"success": True})
                 except Exception as e:
                     return web.json_response({"error": str(e)}, status=500)
+        
+        # ==================== НАСТРОЙКА ПРИЛОЖЕНИЯ ====================
         
         app = web.Application()
         
@@ -4597,6 +4851,14 @@ async def run_http_server():
         app.router.add_get('/api/pending', api_pending_messages)
         app.router.add_post('/api/approve', api_approve)
         app.router.add_post('/api/reject', api_reject)
+        app.router.add_post('/api/skip', api_skip)
+        app.router.add_post('/api/mute', api_mute_user)
+        app.router.add_get('/api/users/search', api_user_search)
+        app.router.add_get('/api/users/banned', api_banned_users)
+        app.router.add_get('/api/users/muted', api_muted_users)
+        app.router.add_get('/api/check_role', api_check_role)
+        app.router.add_post('/api/users/ban', api_ban_user)
+        app.router.add_post('/api/users/unban', api_unban_user)
         app.router.add_get('/api/settings', api_settings)
         app.router.add_post('/api/settings', api_settings)
         
@@ -4606,12 +4868,15 @@ async def run_http_server():
                 if request.method == 'OPTIONS':
                     response = web.Response()
                     response.headers['Access-Control-Allow-Origin'] = '*'
-                    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-                    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Auth'
+                    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+                    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Auth, Authorization'
+                    response.headers['Access-Control-Max-Age'] = '3600'
                     return response
                 
                 response = await handler(request)
                 response.headers['Access-Control-Allow-Origin'] = '*'
+                response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Auth, Authorization'
                 return response
             return middleware
         
@@ -4625,6 +4890,7 @@ async def run_http_server():
         await site.start()
         
         logger.info(f"🌐 HTTP Server with Web App API started on port {port}")
+        logger.info(f"📱 API Endpoints: /api/dashboard, /api/pending, /api/settings, etc.")
         
     except Exception as e:
         logger.error(f"Failed to start HTTP server: {e}")
