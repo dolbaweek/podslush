@@ -2087,7 +2087,7 @@ async def export_history(callback: CallbackQuery):
 
 # ================= СТАТИСТИКА =================
 
-@@dp.message(F.text == "📊 Статистика")
+@dp.message(F.text == "📊 Статистика")
 async def admin_stats(message: Message):
     if message.from_user.id not in ADMINS:
         return
