@@ -3351,7 +3351,7 @@ async def approve(callback: CallbackQuery):
         cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
         style = (await cursor.fetchone())[0]
 
-    ## Публикация опроса
+    # Публикация опроса
     if poll_data:
         try:
             poll = json.loads(poll_data)
@@ -3375,10 +3375,10 @@ async def approve(callback: CallbackQuery):
                 parse_mode=ParseMode.HTML
             )
             
-            # Отправляем опрос (без дублирования вопроса в заголовке)
+            # Отправляем опрос
             await bot.send_poll(
                 CHANNEL_ID,
-                question=" ",  # Пустой вопрос, вариант ответа - голосование снизу
+                question=" ",
                 options=poll['options'],
                 is_anonymous=True,
                 allows_multiple_answers=poll.get('allows_multiple_answers', True),
@@ -3402,7 +3402,7 @@ async def approve(callback: CallbackQuery):
                 try:
                     await bot.send_message(admin, f"📊 <b>Опубликован опрос #{counter}</b> (сообщение #{msg_id})")
                 except:
-                pass
+                    pass
             
             await log_admin_action(callback.from_user.id, "approve", target_id=msg_id, details=f"poll #{counter}")
             
