@@ -1030,6 +1030,8 @@ async def help_text(message: Message):
         "Фото и видео всегда проходят ручную проверку."
     )
 
+# ================= FAQ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ =================
+
 @dp.message(F.text == "❔ FAQ")
 async def faq_button(message: Message):
     """Показывает список FAQ или запускает поиск"""
@@ -1047,14 +1049,16 @@ async def faq_button(message: Message):
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=question, callback_data=f"faq_{faq_id}")]
+        [InlineKeyboardButton(text=question, callback_data=f"faq_show_{faq_id}")]
         for faq_id, question in faqs[:10]
     ])
     
-    if len(faqs) > 10:
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(text="🔍 Поиск по FAQ", callback_data="faq_search")
-        ])
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="🔍 Поиск по FAQ", callback_data="faq_search")
+    ])
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="📋 Все вопросы", callback_data="faq_show_all")
+    ])
     
     await message.answer(
         "❔ <b>Часто задаваемые вопросы</b>\n\n"
@@ -1062,76 +1066,196 @@ async def faq_button(message: Message):
         reply_markup=keyboard
     )
 
+
 @dp.callback_query(F.data.startswith("faq_"))
-async def faq_answer(callback: CallbackQuery):
-    """Показывает ответ на FAQ"""
-    if callback.data == "faq_search":
+async def faq_router(callback: CallbackQuery, state: FSMContext):
+    """Единый обработчик всех FAQ-действий"""
+    
+    action = callback.data
+    
+    # === Показ ответа на вопрос (faq_show_ID) ===
+    if action.startswith("faq_show_"):
+        try:
+            faq_id = int(action.split("_")[2])
+            async with db_pool.acquire() as db:
+                cursor = await db.execute(
+                    "SELECT question, answer FROM faq WHERE id=?",
+                    (faq_id,)
+                )
+                result = await cursor.fetchone()
+                if result:
+                    question, answer = result
+                    await callback.message.answer(f"❔ <b>{question}</b>\n\n{answer}")
+                else:
+                    await callback.answer("Вопрос не найден", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error getting FAQ: {e}")
+            await callback.answer("Ошибка загрузки ответа", show_alert=True)
+        await callback.answer()
+        return
+    
+    # === Поиск ===
+    elif action == "faq_search":
+        await state.set_state(AdminStates.waiting_for_faq_question)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="faq_cancel_search")]
+        ])
         await callback.message.answer(
-            "🔍 Отправьте ключевое слово для поиска в FAQ.\n"
-            "Например: правила, опрос, публикация"
+            "🔍 Введите ключевое слово для поиска в FAQ.\n"
+            "Например: правила, опрос, публикация",
+            reply_markup=keyboard
         )
         await callback.answer()
         return
     
-    faq_id = int(callback.data.split("_")[1])
-    
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT question, answer FROM faq WHERE id=?",
-                (faq_id,)
+    # === Показать все ===
+    elif action == "faq_show_all":
+        try:
+            async with db_pool.acquire() as db:
+                cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
+                faqs = await cursor.fetchall()
+            if not faqs:
+                await callback.message.answer("❔ FAQ пока пуст")
+                await callback.answer()
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=question, callback_data=f"faq_show_{faq_id}")]
+                for faq_id, question in faqs[:15]
+            ])
+            await callback.message.answer(
+                "❔ <b>Все вопросы FAQ:</b>\n\n"
+                "Выберите интересующий вопрос:",
+                reply_markup=keyboard
             )
-            result = await cursor.fetchone()
-            
-            if result:
-                question, answer = result
-                await callback.message.answer(
-                    f"❔ <b>{question}</b>\n\n{answer}"
-                )
-            else:
-                await callback.answer("Вопрос не найден", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error getting FAQ answer: {e}")
-        await callback.answer("Ошибка загрузки ответа", show_alert=True)
+        except:
+            await callback.answer("Ошибка загрузки")
+        await callback.answer()
+        return
     
-    await callback.answer()
+    # === Отмена поиска ===
+    elif action == "faq_cancel_search":
+        await state.clear()
+        await callback.message.delete()
+        await callback.answer("Поиск отменен")
+        return
+    
+    # === АДМИНСКИЕ КОМАНДЫ ===
+    
+    # Добавить FAQ
+    elif action == "faq_add":
+        if callback.from_user.id != SUPER_ADMIN:
+            await callback.answer("Только супер-админ", show_alert=True)
+            return
+        await state.set_state(AdminStates.waiting_for_faq_add)
+        await callback.message.answer(
+            "➕ <b>Добавление FAQ</b>\n\n"
+            "Отправьте данные в формате:\n\n"
+            "<b>Вопрос</b>\n"
+            "<b>Ответ</b>\n"
+            "<b>Ключевые слова</b> (через запятую)\n\n"
+            "Пример:\n"
+            "Как отправить фото?\n"
+            "Отправьте фото в этот чат, оно пройдет модерацию.\n"
+            "фото,отправить,изображение\n\n"
+            "Или /cancel для отмены"
+        )
+        await callback.answer()
+        return
+    
+    # Удалить FAQ (показать список)
+    elif action == "faq_remove":
+        if callback.from_user.id != SUPER_ADMIN:
+            await callback.answer("Только супер-админ", show_alert=True)
+            return
+        try:
+            async with db_pool.acquire() as db:
+                cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
+                faqs = await cursor.fetchall()
+            if not faqs:
+                await callback.message.answer("FAQ пуст")
+                await callback.answer()
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"❌ {question}", callback_data=f"faq_delete_{faq_id}")]
+                for faq_id, question in faqs[:20]
+            ])
+            await callback.message.answer("Выберите вопрос для удаления:", reply_markup=keyboard)
+        except:
+            await callback.answer("Ошибка загрузки")
+        await callback.answer()
+        return
+    
+    # Показать все (админская версия)
+    elif action == "faq_list":
+        if callback.from_user.id != SUPER_ADMIN:
+            return
+        try:
+            async with db_pool.acquire() as db:
+                cursor = await db.execute("SELECT id, question, answer, keywords FROM faq ORDER BY id")
+                faqs = await cursor.fetchall()
+            if not faqs:
+                await callback.message.answer("FAQ пуст")
+                await callback.answer()
+                return
+            text = "❓ <b>Все вопросы FAQ:</b>\n\n"
+            for faq_id, question, answer, keywords in faqs:
+                text += f"<b>#{faq_id}</b> {question}\n"
+                text += f"Ответ: {answer[:100]}...\n"
+                text += f"Ключевые слова: {keywords}\n\n"
+                if len(text) > 3000:
+                    await callback.message.answer(text)
+                    text = ""
+            if text:
+                await callback.message.answer(text)
+        except:
+            await callback.answer("Ошибка загрузки")
+        await callback.answer()
+        return
+    
+    # Обновить кэш
+    elif action == "faq_refresh":
+        if callback.from_user.id != SUPER_ADMIN:
+            return
+        faq_cache.clear()
+        await load_faq_to_cache()
+        await callback.message.answer("🔄 Кэш FAQ обновлен")
+        await callback.answer()
+        return
+    
+    # Закрыть
+    elif action == "faq_close":
+        await callback.message.delete()
+        await callback.answer()
+        return
+    
+    # Удаление конкретного FAQ (faq_delete_ID)
+    elif action.startswith("faq_delete_"):
+        if callback.from_user.id != SUPER_ADMIN:
+            return
+        try:
+            faq_id = int(action.split("_")[2])
+            async with db_pool.acquire() as db:
+                await db.execute("DELETE FROM faq WHERE id=?", (faq_id,))
+                await db.commit()
+            faq_cache.clear()
+            await load_faq_to_cache()
+            await callback.message.edit_text(f"✅ FAQ #{faq_id} удален")
+            await log_admin_action(callback.from_user.id, "faq_remove", details=f"id={faq_id}")
+        except Exception as e:
+            logger.error(f"Error deleting FAQ: {e}")
+            await callback.answer("Ошибка удаления")
+        await callback.answer()
+        return
+    
+    await callback.answer("Неизвестная команда")
 
-@dp.message(F.text == "❔ FAQ")
-async def faq_button(message: Message):
-    """Показывает список FAQ с поиском"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Поиск по FAQ", callback_data="faq_search")],
-        [InlineKeyboardButton(text="📋 Все вопросы", callback_data="faq_show_all")]
-    ])
-    
-    await message.answer(
-        "❔ <b>Часто задаваемые вопросы</b>\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard
-    )
 
-@dp.callback_query(F.data == "faq_search")
-async def faq_search_prompt(callback: CallbackQuery, state: FSMContext):
-    """Запрашивает поисковый запрос"""
-    await state.set_state(AdminStates.waiting_for_faq_question)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="faq_cancel_search")]
-    ])
-    
-    await callback.message.answer(
-        "🔍 Введите ключевое слово для поиска:\n"
-        "Например: правила, опрос, публикация, отправить\n\n"
-        "Или нажмите кнопку для выхода из поиска.",
-        reply_markup=keyboard
-    )
-    await callback.answer()
+# ================= ПОИСК FAQ (FSM) =================
 
 @dp.message(AdminStates.waiting_for_faq_question)
 async def faq_search_result(message: Message, state: FSMContext):
     """Обрабатывает поисковый запрос FAQ"""
     
-    # Проверяем команду отмены
     if message.text == "/cancel":
         await state.clear()
         await message.answer("❌ Поиск отменен")
@@ -1155,29 +1279,25 @@ async def faq_search_result(message: Message, state: FSMContext):
     
     found = []
     for question, answer, keywords in all_faqs:
-        # Ищем в вопросе и ключевых словах
         if search_text in question.lower():
-            found.append((question, answer, 1))  # Приоритет 1 - совпадение в вопросе
+            found.append((question, answer, 1))
         else:
             keywords_list = keywords.split(',')
             for keyword in keywords_list:
                 if keyword.strip() in search_text or search_text in keyword.strip():
-                    found.append((question, answer, 2))  # Приоритет 2 - совпадение в ключах
+                    found.append((question, answer, 2))
                     break
     
-    # Сортируем по приоритету
     found.sort(key=lambda x: x[2])
     
     if found:
         await message.answer(f"🔍 Найдено результатов: {len(found)}\n")
-        
-        for question, answer, _ in found[:5]:  # Показываем до 5 результатов
+        for question, answer, _ in found[:5]:
             await message.answer(
                 f"❔ <b>{question}</b>\n\n{answer}\n\n"
                 f"━━━━━━━━━━━━━━━━"
             )
             await asyncio.sleep(0.3)
-        
         if len(found) > 5:
             await message.answer(f"... и ещё {len(found) - 5} результатов. Уточните запрос.")
     else:
@@ -1188,102 +1308,60 @@ async def faq_search_result(message: Message, state: FSMContext):
     
     await state.clear()
 
-@dp.callback_query(F.data == "faq_show_all")
-async def faq_show_all(callback: CallbackQuery):
-    """Показывает все FAQ вопросы"""
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
-            faqs = await cursor.fetchall()
-    except:
-        await callback.answer("Ошибка загрузки")
-        return
-    
-    if not faqs:
-        await callback.message.answer("❔ FAQ пока пуст")
-        await callback.answer()
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=question, callback_data=f"faq_{faq_id}")]
-        for faq_id, question in faqs[:15]
-    ])
-    
-    await callback.message.answer(
-        "❔ <b>Все вопросы FAQ:</b>\n\n"
-        "Выберите интересующий вопрос:",
-        reply_markup=keyboard
-    )
-    await callback.answer()
 
-@dp.callback_query(F.data == "faq_cancel_search")
-async def faq_cancel_search(callback: CallbackQuery, state: FSMContext):
-    """Отменяет поиск FAQ"""
-    await state.clear()
-    await callback.message.delete()
-    await callback.answer("Поиск отменен")
+# ================= ДОБАВЛЕНИЕ FAQ (FSM) =================
 
-@dp.callback_query(F.data.startswith("faq_"))
-async def faq_answer(callback: CallbackQuery):
-    """Показывает ответ на FAQ"""
-    if callback.data in ["faq_search", "faq_show_all", "faq_cancel_search"]:
+@dp.message(AdminStates.waiting_for_faq_add)
+async def process_faq_add(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN:
+        await state.clear()
         return
     
-    faq_id = int(callback.data.split("_")[1])
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Добавление отменено")
+        return
     
     try:
+        lines = message.text.strip().split('\n')
+        if len(lines) < 3:
+            await message.answer("❌ Неверный формат. Нужно минимум 3 строки: вопрос, ответ, ключевые слова")
+            return
+        
+        question = lines[0].strip()
+        answer = lines[1].strip()
+        keywords = lines[2].strip().lower()
+        
+        if not question or not answer or not keywords:
+            await message.answer("❌ Все поля должны быть заполнены")
+            return
+        
         async with db_pool.acquire() as db:
-            cursor = await db.execute(
-                "SELECT question, answer FROM faq WHERE id=?",
-                (faq_id,)
+            await db.execute(
+                "INSERT INTO faq (question, answer, keywords, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                (question, answer, keywords, message.from_user.id, datetime.utcnow().isoformat())
             )
-            result = await cursor.fetchone()
-            
-            if result:
-                question, answer = result
-                await callback.message.answer(
-                    f"❔ <b>{question}</b>\n\n{answer}"
-                )
-            else:
-                await callback.answer("Вопрос не найден", show_alert=True)
+            await db.commit()
+        
+        faq_cache.clear()
+        await load_faq_to_cache()
+        
+        await message.answer(
+            f"✅ FAQ добавлен:\n\n"
+            f"<b>Вопрос:</b> {question}\n"
+            f"<b>Ответ:</b> {answer}\n"
+            f"<b>Ключевые слова:</b> {keywords}"
+        )
+        await log_admin_action(message.from_user.id, "faq_add", details=question)
+        
     except Exception as e:
-        logger.error(f"Error getting FAQ answer: {e}")
-        await callback.answer("Ошибка загрузки ответа", show_alert=True)
+        logger.error(f"Error adding FAQ: {e}")
+        await message.answer("❌ Ошибка при добавлении FAQ")
     
-    await callback.answer()
+    await state.clear()
 
-## ================= ВЕБ-ПАНЕЛЬ (Web App) =================
 
-@dp.message(F.text == "🌐 Веб-панель")
-async def open_web_panel(message: Message):
-    """Открывает Web App для администраторов"""
-    if message.from_user.id not in ADMINS:
-        return
-    
-    # Формируем URL с параметрами для авторизации
-    user_id = message.from_user.id
-    username = message.from_user.username or "unknown"
-    
-    web_app_url = f"{WEB_APP_URL}?user_id={user_id}&username={username}"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔧 Открыть панель управления",
-            web_app=WebAppInfo(url=web_app_url)
-        )]
-    ])
-    
-    await message.answer(
-        "🌐 <b>Веб-панель администратора</b>\n\n"
-        "Нажмите кнопку ниже для открытия панели управления.\n\n"
-        "📊 Статистика\n"
-        "📨 Модерация сообщений\n"
-        "👥 Управление пользователями\n"
-        "⚙️ Настройки бота",
-        reply_markup=keyboard
-    )
-
-# ================= УПРАВЛЕНИЕ FAQ (только супер-админ) =================
+# ================= УПРАВЛЕНИЕ FAQ (супер-админ) =================
 
 @dp.message(F.text == "❓ Управление FAQ")
 async def manage_faq(message: Message):
@@ -1318,172 +1396,36 @@ async def manage_faq(message: Message):
     
     await message.answer(text, reply_markup=keyboard)
 
-@dp.callback_query(F.data == "faq_add")
-async def faq_add_prompt(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    await state.set_state(AdminStates.waiting_for_faq_add)
-    await callback.message.answer(
-        "➕ <b>Добавление FAQ</b>\n\n"
-        "Отправьте данные в формате:\n\n"
-        "<b>Вопрос</b>\n"
-        "<b>Ответ</b>\n"
-        "<b>Ключевые слова</b> (через запятую)\n\n"
-        "Пример:\n"
-        "Как отправить фото?\n"
-        "Отправьте фото в этот чат, оно пройдет модерацию.\n"
-        "фото,отправить,изображение\n\n"
-        "Или /cancel для отмены"
-    )
-    await callback.answer()
 
-@dp.message(AdminStates.waiting_for_faq_add)
-async def process_faq_add(message: Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN:
-        await state.clear()
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("❌ Добавление отменено")
-        return
-    
-    try:
-        lines = message.text.strip().split('\n')
-        if len(lines) < 3:
-            await message.answer("❌ Неверный формат. Нужно минимум 3 строки: вопрос, ответ, ключевые слова")
-            return
-        
-        question = lines[0].strip()
-        answer = lines[1].strip()
-        keywords = lines[2].strip().lower()
-        
-        if not question or not answer or not keywords:
-            await message.answer("❌ Все поля должны быть заполнены")
-            return
-        
-        async with db_pool.acquire() as db:
-            await db.execute(
-                "INSERT INTO faq (question, answer, keywords, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                (question, answer, keywords, message.from_user.id, datetime.utcnow().isoformat())
-            )
-            await db.commit()
-        
-        # Обновляем кэш
-        faq_cache.clear()
-        await load_faq_to_cache()
-        
-        await message.answer(
-            f"✅ FAQ добавлен:\n\n"
-            f"<b>Вопрос:</b> {question}\n"
-            f"<b>Ответ:</b> {answer}\n"
-            f"<b>Ключевые слова:</b> {keywords}"
-        )
-        await log_admin_action(message.from_user.id, "faq_add", details=question)
-        
-    except Exception as e:
-        logger.error(f"Error adding FAQ: {e}")
-        await message.answer("❌ Ошибка при добавлении FAQ")
-    
-    await state.clear()
+# ================= ВЕБ-ПАНЕЛЬ (Web App) =================
 
-@dp.callback_query(F.data == "faq_remove")
-async def faq_remove_prompt(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
+@dp.message(F.text == "🌐 Веб-панель")
+async def open_web_panel(message: Message):
+    """Открывает Web App для администраторов"""
+    if message.from_user.id not in ADMINS:
         return
     
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute("SELECT id, question FROM faq ORDER BY id")
-            faqs = await cursor.fetchall()
-    except:
-        await callback.answer("Ошибка загрузки")
-        return
+    user_id = message.from_user.id
+    username = message.from_user.username or "unknown"
     
-    if not faqs:
-        await callback.message.answer("FAQ пуст")
-        await callback.answer()
-        return
+    web_app_url = f"{WEB_APP_URL}?user_id={user_id}&username={username}"
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"❌ {question}", callback_data=f"faq_delete_{faq_id}")]
-        for faq_id, question in faqs[:20]
+        [InlineKeyboardButton(
+            text="🔧 Открыть панель управления",
+            web_app=WebAppInfo(url=web_app_url)
+        )]
     ])
     
-    await callback.message.answer("Выберите вопрос для удаления:", reply_markup=keyboard)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("faq_delete_"))
-async def faq_delete(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    
-    faq_id = int(callback.data.split("_")[2])
-    
-    try:
-        async with db_pool.acquire() as db:
-            await db.execute("DELETE FROM faq WHERE id=?", (faq_id,))
-            await db.commit()
-        
-        faq_cache.clear()
-        await load_faq_to_cache()
-        
-        await callback.message.edit_text(f"✅ FAQ #{faq_id} удален")
-        await log_admin_action(callback.from_user.id, "faq_remove", details=f"id={faq_id}")
-    except Exception as e:
-        logger.error(f"Error deleting FAQ: {e}")
-        await callback.answer("Ошибка удаления")
-    
-    await callback.answer()
-
-@dp.callback_query(F.data == "faq_list")
-async def faq_list(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    
-    try:
-        async with db_pool.acquire() as db:
-            cursor = await db.execute("SELECT id, question, answer, keywords FROM faq ORDER BY id")
-            faqs = await cursor.fetchall()
-    except:
-        await callback.answer("Ошибка загрузки")
-        return
-    
-    if not faqs:
-        await callback.message.answer("FAQ пуст")
-        await callback.answer()
-        return
-    
-    text = "❓ <b>Все вопросы FAQ:</b>\n\n"
-    for faq_id, question, answer, keywords in faqs:
-        text += f"<b>#{faq_id}</b> {question}\n"
-        text += f"Ответ: {answer[:100]}...\n"
-        text += f"Ключевые слова: {keywords}\n\n"
-        
-        if len(text) > 3000:
-            await callback.message.answer(text)
-            text = ""
-    
-    if text:
-        await callback.message.answer(text)
-    
-    await callback.answer()
-
-@dp.callback_query(F.data == "faq_refresh")
-async def faq_refresh(callback: CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN:
-        return
-    
-    faq_cache.clear()
-    await load_faq_to_cache()
-    
-    await callback.message.edit_text("🔄 Кэш FAQ обновлен")
-    await callback.answer()
-
-@dp.callback_query(F.data == "faq_close")
-async def faq_close(callback: CallbackQuery):
-    await callback.message.delete()
-    await callback.answer()
+    await message.answer(
+        "🌐 <b>Веб-панель администратора</b>\n\n"
+        "Нажмите кнопку ниже для открытия панели управления.\n\n"
+        "📊 Статистика\n"
+        "📨 Модерация сообщений\n"
+        "👥 Управление пользователями\n"
+        "⚙️ Настройки бота",
+        reply_markup=keyboard
+    )
 
 # ================= ОПРОСЫ =================
 
@@ -1514,11 +1456,6 @@ async def create_poll_start(message: Message, state: FSMContext):
                     return
         except Exception as e:
             logger.error(f"DB error in maintenance check: {e}")
-    
-    # Проверяем капчу
-    if not await check_user_captcha(user_id):
-        await message.answer("🤖 Сначала пройдите проверку. Отправьте любое сообщение.")
-        return
     
     await state.set_state(AdminStates.waiting_for_poll_question)
     await message.answer(
@@ -1612,11 +1549,11 @@ async def poll_options(message: Message, state: FSMContext):
     options = [opt.strip() for opt in options_text.split('\n') if opt.strip()]
     
     if len(options) < 2:
-        await message.answer("❌ Минимум 2 варианта ответа.")
+        await message.answer("❌ Минимум 2 варианта ответа на опрос.")
         return
     
     if len(options) > 10:
-        await message.answer("❌ Максимум 10 вариантов ответа.")
+        await message.answer("❌ Максимум 10 вариантов ответа на опрос.")
         return
     
     for opt in options:
@@ -2368,12 +2305,12 @@ async def set_captcha_passed(user_id: int):
         try:
             async with db_pool.acquire() as db:
                 # Проверяем, существует ли колонка
-                try:
-                    await db.execute("ALTER TABLE users ADD COLUMN captcha_passed INTEGER DEFAULT 0")
-                    await db.commit()
-                    logger.info("Added captcha_passed column to users table")
-                except:
-                    pass  # Колонка уже существует или другая ошибка
+            #    try:
+            #        await db.execute("ALTER TABLE users ADD COLUMN captcha_passed INTEGER DEFAULT 0")
+            #        await db.commit()
+             #       logger.info("Added captcha_passed column to users table")
+            #    except:
+            #        pass  # Колонка уже существует или другая ошибка
                 
                 # Пробуем снова обновить
                 await db.execute(
@@ -2556,42 +2493,42 @@ async def handle_user_media(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
 
-    # ========== ПРОВЕРКА КАПЧИ ==========
-    if not await check_user_captcha(user_id):
-        if user_id in captcha_cache:
-            # Уже есть активная капча - проверяем ответ
-            if message.text and message.text.strip() == captcha_cache[user_id]:
-                # Правильный ответ!
-                await set_captcha_passed(user_id)
-                del captcha_cache[user_id]
-                await message.answer(
-                    "✅ Проверка пройдена! Теперь вы можете отправлять сообщения.\n\n"
-                    "Отправьте текст, фото или видео для публикации.\n"
-                    "Используйте кнопки меню для навигации."
-                )
-                return
-            else:
-                # Неправильный ответ - генерируем новую капчу
-                question, answer = generate_captcha()
-                captcha_cache[user_id] = answer
-                await message.answer(
-                    "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
-                    f"<b>{question} = ?</b>\n\n"
-                    "Отправьте только число."
-                )
-                return
-        else:
-            # Первый раз - отправляем капчу
-            question, answer = generate_captcha()
-            captcha_cache[user_id] = answer
-            
-            await message.answer(
-                "🤖 <b>Проверка на бота</b>\n\n"
-                f"Решите пример: <b>{question} = ?</b>\n\n"
-                "Отправьте только число в ответном сообщении.\n"
-                "Это нужно сделать один раз."
-            )
-            return
+   # # ========== ПРОВЕРКА КАПЧИ ==========
+    # if not await check_user_captcha(user_id):
+    #    if user_id in captcha_cache:
+    #         # Уже есть активная капча - проверяем ответ
+    #         if message.text and message.text.strip() == captcha_cache[user_id]:
+    #             # Правильный ответ!
+    #             await set_captcha_passed(user_id)
+    #             del captcha_cache[user_id]
+    #             await message.answer(
+    #                "✅ Проверка пройдена! Теперь вы можете отправлять сообщения.\n\n"
+    #                "Отправьте текст, фото или видео для публикации.\n"
+    #                "Используйте кнопки меню для навигации."
+    #            )
+    #            return
+    #        else:
+    #            # Неправильный ответ - генерируем новую капчу
+    #            question, answer = generate_captcha()
+    #           captcha_cache[user_id] = answer
+    #            await message.answer(
+    #                "❌ Неверный ответ. Попробуйте ещё раз:\n\n"
+    #                f"<b>{question} = ?</b>\n\n"
+    #                "Отправьте только число."
+    #            )
+    #            return
+    #    else:
+    #        # Первый раз - отправляем капчу
+    #       question, answer = generate_captcha()
+    #        captcha_cache[user_id] = answer
+    #        
+    #        await message.answer(
+    #            "🤖 <b>Проверка на бота</b>\n\n"
+    #            f"Решите пример: <b>{question} = ?</b>\n\n"
+    #            "Отправьте только число в ответном сообщении.\n"
+    #            "Это нужно сделать один раз."
+    #        )
+    #        return
     # ===================================
     
     now = datetime.utcnow()
