@@ -3351,32 +3351,32 @@ async def approve(callback: CallbackQuery):
         cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
         style = (await cursor.fetchone())[0]
 
-    # Если это опрос
+    # Публикация опроса
     if poll_data:
         try:
             poll = json.loads(poll_data)
-        
-        # Получаем стиль
+            
+            # Получаем стиль
             async with db_pool.acquire() as db:
                 cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
                 style = (await cursor.fetchone())[0]
-        
-        # Формируем заголовок
+            
+            # Формируем заголовок
             if style == "1":
                 header = "💬 <b>Новый анонимный опрос</b>\n\n"
             elif style == "2":
                 header = "┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
             else:
                 header = "📌 <b>Анонимный опрос</b>\n\n"
-        
-        # Сначала отправляем заголовок с вопросом в рамке
+            
+            # Сначала отправляем заголовок с вопросом в рамке
             await bot.send_message(
                 CHANNEL_ID,
                 f"{header}<blockquote>{escape_html(poll['question'])}</blockquote>",
                 parse_mode=ParseMode.HTML
             )
-        
-        # Затем отправляем сам опрос
+            
+            # Затем отправляем сам опрос
             await bot.send_poll(
                 CHANNEL_ID,
                 question=poll['question'],
@@ -3385,29 +3385,29 @@ async def approve(callback: CallbackQuery):
                 allows_multiple_answers=poll.get('allows_multiple_answers', True),
                 type='regular'
             )
-        
-        # Обновляем статус
+            
+            # Обновляем статус
             async with db_pool.acquire() as db:
                 await db.execute(
                     "UPDATE messages SET status='approved' WHERE id=?",
                     (msg_id,)
                 )
                 await db.commit()
-        
+            
             try:
                 await bot.send_message(user_id, "✅ Ваш опрос опубликован в канале!")
             except:
                 pass
-        
+            
             for admin in ADMINS:
                 try:
                     await bot.send_message(admin, f"📊 <b>Опубликован опрос #{counter}</b> (сообщение #{msg_id})")
-                 except:
+                except:
                     pass
-        
+            
             await log_admin_action(callback.from_user.id, "approve", target_id=msg_id, details=f"poll #{counter}")
-        
-        # Обновляем сообщение у админа
+            
+            # Обновляем сообщение у админа
             try:
                 if callback.message.photo or callback.message.video:
                     await callback.message.edit_caption(
@@ -3421,10 +3421,10 @@ async def approve(callback: CallbackQuery):
                     )
             except:
                 pass
-        
+            
             await callback.answer()
             return
-        
+            
         except Exception as e:
             logger.error(f"Error publishing poll: {e}")
             async with db_pool.acquire() as db:
