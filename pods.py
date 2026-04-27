@@ -3353,65 +3353,88 @@ async def approve(callback: CallbackQuery):
 
     # Если это опрос
     if poll_data:
-        try:
-            poll = json.loads(poll_data)
-            
-            await bot.send_poll(
-                CHANNEL_ID,
-                question=poll['question'],
-                options=poll['options'],
-                is_anonymous=True,
-                allows_multiple_answers=poll.get('allows_multiple_answers', True),
-                type='regular'
+    try:
+        poll = json.loads(poll_data)
+        
+        # Получаем стиль
+        async with db_pool.acquire() as db:
+            cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
+            style = (await cursor.fetchone())[0]
+        
+        # Формируем заголовок
+        if style == "1":
+            header = "💬 <b>Новый анонимный опрос</b>\n\n"
+        elif style == "2":
+            header = "┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
+        else:
+            header = "📌 <b>Анонимный опрос</b>\n\n"
+        
+        # Сначала отправляем заголовок с вопросом в рамке
+        await bot.send_message(
+            CHANNEL_ID,
+            f"{header}<blockquote>{escape_html(poll['question'])}</blockquote>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Затем отправляем сам опрос
+        await bot.send_poll(
+            CHANNEL_ID,
+            question=poll['question'],
+            options=poll['options'],
+            is_anonymous=True,
+            allows_multiple_answers=poll.get('allows_multiple_answers', True),
+            type='regular'
+        )
+        
+        # Обновляем статус
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE messages SET status='approved' WHERE id=?",
+                (msg_id,)
             )
-            
-            async with db_pool.acquire() as db:
-                await db.execute(
-                    "UPDATE messages SET status='approved' WHERE id=?",
-                    (msg_id,)
-                )
-                await db.commit()
-            
+            await db.commit()
+        
+        try:
+            await bot.send_message(user_id, "✅ Ваш опрос опубликован в канале!")
+        except:
+            pass
+        
+        for admin in ADMINS:
             try:
-                await bot.send_message(user_id, "✅ Ваш опрос опубликован в канале!")
+                await bot.send_message(admin, f"📊 <b>Опубликован опрос #{counter}</b> (сообщение #{msg_id})")
             except:
                 pass
-            
-            for admin in ADMINS:
-                try:
-                    await bot.send_message(admin, f"📊 <b>Опубликован опрос #{counter}</b> (сообщение #{msg_id})")
-                except:
-                    pass
-            
-            await log_admin_action(callback.from_user.id, "approve", target_id=msg_id, details=f"poll #{counter}")
-            
-            try:
-                if callback.message.photo or callback.message.video:
-                    await callback.message.edit_caption(
-                        caption=callback.message.caption.replace("\n\n🔄 <b>Рассматривается...</b>", "") + "\n\n✅ <b>ОПРОС ОПУБЛИКОВАН</b>",
-                        reply_markup=None
-                    )
-                else:
-                    await callback.message.edit_text(
-                        text=callback.message.text.replace("\n\n🔄 <b>Рассматривается...</b>", "") + "\n\n✅ <b>ОПРОС ОПУБЛИКОВАН</b>",
-                        reply_markup=None
-                    )
-            except:
-                pass
-            
-            await callback.answer()
-            return
-            
-        except Exception as e:
-            logger.error(f"Error publishing poll: {e}")
-            async with db_pool.acquire() as db:
-                await db.execute(
-                    "UPDATE messages SET status='pending', reviewed_at=NULL WHERE id=?",
-                    (msg_id,)
+        
+        await log_admin_action(callback.from_user.id, "approve", target_id=msg_id, details=f"poll #{counter}")
+        
+        # Обновляем сообщение у админа
+        try:
+            if callback.message.photo or callback.message.video:
+                await callback.message.edit_caption(
+                    caption=callback.message.caption.replace("\n\n🔄 <b>Рассматривается...</b>", "") + "\n\n✅ <b>ОПРОС ОПУБЛИКОВАН</b>",
+                    reply_markup=None
                 )
-                await db.commit()
-            await callback.answer("❌ Ошибка при публикации опроса", show_alert=True)
-            return
+            else:
+                await callback.message.edit_text(
+                    text=callback.message.text.replace("\n\n🔄 <b>Рассматривается...</b>", "") + "\n\n✅ <b>ОПРОС ОПУБЛИКОВАН</b>",
+                    reply_markup=None
+                )
+        except:
+            pass
+        
+        await callback.answer()
+        return
+        
+    except Exception as e:
+        logger.error(f"Error publishing poll: {e}")
+        async with db_pool.acquire() as db:
+            await db.execute(
+                "UPDATE messages SET status='pending', reviewed_at=NULL WHERE id=?",
+                (msg_id,)
+            )
+            await db.commit()
+        await callback.answer("❌ Ошибка при публикации опроса", show_alert=True)
+        return
 
     # Обычное сообщение
     escaped_text = escape_html(text) if text else ""
