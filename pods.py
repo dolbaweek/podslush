@@ -3353,7 +3353,7 @@ async def approve(callback: CallbackQuery):
 
     # Если это опрос
     if poll_data:
-    try:
+        try:
         poll = json.loads(poll_data)
         
         # Получаем стиль
