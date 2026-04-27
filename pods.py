@@ -3361,24 +3361,25 @@ async def approve(callback: CallbackQuery):
                 cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
                 style = (await cursor.fetchone())[0]
             
-            # Формируем заголовок и отправляем
+            # Формируем заголовок
             if style == "1":
-                header = "💬 <b>Новый анонимный опрос</b>\n\n"
+                header = "💬 <b>Новый анонимный опрос</b>"
             elif style == "2":
-                header = "┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘\n\n"
+                header = "┌─────────────────┐\n│  ПОДСЛУШАНО  │\n└─────────────────┘"
             else:
-                header = "📌 <b>Анонимный опрос</b>\n\n"
+                header = "📌 <b>Анонимный опрос</b>"
             
+            # Отправляем заголовок
             await bot.send_message(
                 CHANNEL_ID,
-                f"{header}<blockquote>{escape_html(poll['question'])}</blockquote>",
+                header,
                 parse_mode=ParseMode.HTML
             )
             
             # Отправляем опрос
             await bot.send_poll(
                 CHANNEL_ID,
-                question=" ",
+                question=poll['question'],
                 options=poll['options'],
                 is_anonymous=True,
                 allows_multiple_answers=poll.get('allows_multiple_answers', True),
