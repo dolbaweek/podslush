@@ -3351,7 +3351,7 @@ async def approve(callback: CallbackQuery):
         cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
         style = (await cursor.fetchone())[0]
 
-    # Публикация опроса
+    ## Публикация опроса
     if poll_data:
         try:
             poll = json.loads(poll_data)
