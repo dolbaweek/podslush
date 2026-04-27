@@ -3361,7 +3361,7 @@ async def approve(callback: CallbackQuery):
                 cursor = await db.execute("SELECT value FROM settings WHERE key='post_style'")
                 style = (await cursor.fetchone())[0]
             
-            # Формируем заголовок
+            # Формируем заголовок и отправляем
             if style == "1":
                 header = "💬 <b>Новый анонимный опрос</b>\n\n"
             elif style == "2":
@@ -3369,17 +3369,16 @@ async def approve(callback: CallbackQuery):
             else:
                 header = "📌 <b>Анонимный опрос</b>\n\n"
             
-            # Сначала отправляем заголовок с вопросом в рамке
             await bot.send_message(
                 CHANNEL_ID,
                 f"{header}<blockquote>{escape_html(poll['question'])}</blockquote>",
                 parse_mode=ParseMode.HTML
             )
             
-            # Затем отправляем сам опрос
+            # Отправляем опрос (без дублирования вопроса в заголовке)
             await bot.send_poll(
                 CHANNEL_ID,
-                question=poll['question'],
+                question=" ",  # Пустой вопрос, вариант ответа - голосование снизу
                 options=poll['options'],
                 is_anonymous=True,
                 allows_multiple_answers=poll.get('allows_multiple_answers', True),
@@ -3403,11 +3402,10 @@ async def approve(callback: CallbackQuery):
                 try:
                     await bot.send_message(admin, f"📊 <b>Опубликован опрос #{counter}</b> (сообщение #{msg_id})")
                 except:
-                    pass
+                pass
             
             await log_admin_action(callback.from_user.id, "approve", target_id=msg_id, details=f"poll #{counter}")
             
-            # Обновляем сообщение у админа
             try:
                 if callback.message.photo or callback.message.video:
                     await callback.message.edit_caption(
