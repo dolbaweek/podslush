@@ -3075,7 +3075,7 @@ async def approve_with_watermark(callback: CallbackQuery):
         await bot.send_photo(
             CHANNEL_ID,
             photo=new_file_id,
-            caption=f"{header}{escaped_text}{footer}",
+            caption=f"{header}<blockquote>{escaped_text}</blockquote>{footer}",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
@@ -3450,7 +3450,7 @@ async def approve(callback: CallbackQuery):
 
     try:
         if media_type == "photo":
-            caption = f"{header}{escaped_text}{footer}" if escaped_text else f"{header}{footer}"
+            caption = f"{header}<blockquote>{escaped_text}</blockquote>{footer}" if escaped_text else f"{header}{footer}"
             await bot.send_photo(
                 CHANNEL_ID,
                 photo=media_file_id,
@@ -3458,7 +3458,7 @@ async def approve(callback: CallbackQuery):
                 parse_mode=ParseMode.HTML
             )
         elif media_type == "video":
-            caption = f"{header}{escaped_text}{footer}" if escaped_text else f"{header}{footer}"
+            caption = f"{header}<blockquote>{escaped_text}</blockquote>{footer}" if escaped_text else f"{header}{footer}"
             await bot.send_video(
                 CHANNEL_ID,
                 video=media_file_id,
