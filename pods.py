@@ -43,7 +43,7 @@ from aiogram.client.default import DefaultBotProperties
 
 TOKEN = os.getenv('BOT_TOKEN', "8587934352:AAHdfiuD0VrNQ-Dp0801dYNnR7_nae92Aso")
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', "-1003713957228"))
-SUPER_ADMIN = int(os.getenv('SUPER_ADMIN', "8438783644"))
+SUPER_ADMIN = int(os.getenv('SUPER_ADMIN', "8438783644,8510555377"))
 ADMINS = [int(x) for x in os.getenv('ADMINS', "8438783644,8488564574,8283468381").split(',')]
 BOT_USERNAME = os.getenv('BOT_USERNAME', "pods10_bot")
 WEB_APP_URL = os.getenv('WEB_APP_URL', "https://your-app.vercel.app")
