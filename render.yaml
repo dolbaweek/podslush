@@ -12,6 +12,6 @@ services:
       - key: SUPER_ADMIN
         value: 8438783644
       - key: ADMINS
-        value: 8438783644,8488564574,8283468381
+        value: 8438783644,8488564574,8283468381,5009051944
       - key: BOT_USERNAME
         value: pods10_bot
